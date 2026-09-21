@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
@@ -39,6 +40,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -113,6 +117,32 @@ fun SmartCopyScreen() {
         if (uri != null) CopyEngine.setDestination(uri)
     }
     val notifPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    var confirmMove by remember { mutableStateOf(false) }
+
+    if (confirmMove) {
+        val pending = s.items.count { it.status != ItemStatus.DONE && it.status != ItemStatus.SKIPPED }
+        AlertDialog(
+            onDismissRequest = { confirmMove = false },
+            containerColor = CardBg,
+            title = { Text("Déplacer $pending fichier(s) ?", color = TextMain) },
+            text = {
+                Text(
+                    "Chaque original sera supprimé une fois sa copie vérifiée. " +
+                        "Les fichiers en échec restent à leur place.",
+                    color = Muted
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmMove = false
+                    CopyEngine.start()
+                }) { Text("Déplacer", color = Orange) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmMove = false }) { Text("Annuler", color = TextMain) }
+            }
+        )
+    }
 
     LaunchedEffect(Unit) {
         if (Build.VERSION.SDK_INT >= 33 &&
@@ -139,7 +169,14 @@ fun SmartCopyScreen() {
             Controls(
                 s,
                 onAddFiles = { pickFiles.launch(arrayOf("*/*")) },
-                onAddFolder = { pickFolder.launch(null) }
+                onAddFolder = { pickFolder.launch(null) },
+                onStart = {
+                    if (s.mode == TransferMode.MOVE) {
+                        confirmMove = true
+                    } else {
+                        CopyEngine.start()
+                    }
+                }
             )
         }
         val msg = s.message
@@ -333,7 +370,7 @@ private fun ProgressPanel(s: UiState) {
 
 private fun statusLabel(s: UiState): String = when {
     s.running && s.paused -> "En pause"
-    s.running -> "Copie en cours"
+    s.running -> if (s.mode == TransferMode.MOVE) "Déplacement en cours" else "Copie en cours"
     s.filesTotal > 0 && s.filesDone + s.filesSkipped == s.filesTotal -> "Terminé"
     else -> "Prêt"
 }
@@ -346,7 +383,7 @@ private fun statusColor(s: UiState): Color = when {
 }
 
 @Composable
-private fun Controls(s: UiState, onAddFiles: () -> Unit, onAddFolder: () -> Unit) {
+private fun Controls(s: UiState, onAddFiles: () -> Unit, onAddFolder: () -> Unit, onStart: () -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             ActionButton("+ Fichiers", Blue, modifier = Modifier.weight(1f), onClick = onAddFiles)
@@ -355,11 +392,12 @@ private fun Controls(s: UiState, onAddFiles: () -> Unit, onAddFolder: () -> Unit
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             if (!s.running) {
                 ActionButton(
-                    "Démarrer",
-                    Green,
+                    if (s.mode == TransferMode.MOVE) "Déplacer" else "Démarrer",
+                    if (s.mode == TransferMode.MOVE) Orange else Green,
                     enabled = s.destination != null && s.items.any { it.status != ItemStatus.DONE && it.status != ItemStatus.SKIPPED } && s.analyzing == null,
-                    modifier = Modifier.weight(1f)
-                ) { CopyEngine.start() }
+                    modifier = Modifier.weight(1f),
+                    onClick = onStart
+                )
                 ActionButton(
                     "Vider la liste",
                     Neutral,
@@ -421,12 +459,18 @@ private fun ItemRow(item: ItemUi) {
         ItemStatus.PENDING -> Muted
     }
     val label = when (item.status) {
-        ItemStatus.DONE -> if (item.verified > 0) "Copié · vérifié" else "Copié"
+        ItemStatus.DONE -> when {
+            item.instant -> "Déplacé (instantané)"
+            item.moved && item.verified > 0 -> "Déplacé · vérifié"
+            item.moved -> "Déplacé"
+            item.verified > 0 -> "Copié · vérifié"
+            else -> "Copié"
+        }
         ItemStatus.FAILED -> "Échec"
         ItemStatus.CANCELLED -> "Annulé"
         ItemStatus.COPYING -> String.format(Locale.FRANCE, "%.0f %%", copyFrac * 100f)
         ItemStatus.VERIFYING -> String.format(Locale.FRANCE, "Vérif. %.0f %%", verifyFrac * 100f)
-        ItemStatus.SKIPPED -> "Ignoré (déjà présent)"
+        ItemStatus.SKIPPED -> if (item.moved) "Identique · original supprimé" else "Ignoré (déjà présent)"
         ItemStatus.PENDING -> "En attente"
     }
     Column(
@@ -448,7 +492,8 @@ private fun ItemRow(item: ItemUi) {
             Text(label, color = color, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
         }
         when (item.status) {
-            ItemStatus.COPYING, ItemStatus.DONE -> Bar(copyFrac, color, 6.dp)
+            ItemStatus.COPYING -> Bar(copyFrac, color, 6.dp)
+            ItemStatus.DONE -> Bar(1f, color, 6.dp)
             ItemStatus.VERIFYING -> Bar(verifyFrac, Orange, 6.dp)
             else -> {
             }
@@ -470,25 +515,46 @@ private fun ItemRow(item: ItemUi) {
         if (item.status == ItemStatus.FAILED && err != null) {
             Text(err, color = Red, fontSize = 11.sp)
         }
+        val warn = item.warning
+        if (warn != null) {
+            Text(warn, color = Orange, fontSize = 11.sp)
+        }
     }
 }
 
 @Composable
 private fun OptionsPanel(s: UiState) {
+    val move = s.mode == TransferMode.MOVE
     Panel("Options") {
+        Text("Mode", color = TextMain, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            for (m in TransferMode.values()) {
+                Chip(
+                    m.label,
+                    selected = s.mode == m,
+                    enabled = !s.running,
+                    selectedColor = if (m == TransferMode.MOVE) Orange else Blue,
+                    modifier = Modifier.weight(1f)
+                ) { CopyEngine.setMode(m) }
+            }
+        }
+        Text(s.mode.help, color = Muted, fontSize = 12.sp)
+        Spacer(Modifier.height(4.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Text("Vérifier chaque copie", color = TextMain, fontSize = 14.sp, fontWeight = FontWeight.Medium)
                 Text(
-                    "Relit la copie et compare son empreinte SHA-256 avec celle de l'original.",
+                    if (move) "Toujours active en mode Déplacer : l'original n'est supprimé qu'après vérification."
+                    else "Relit la copie et compare son empreinte SHA-256 avec celle de l'original.",
                     color = Muted,
                     fontSize = 12.sp
                 )
             }
             Spacer(Modifier.width(12.dp))
             Switch(
-                checked = s.verify,
+                checked = s.verify || move,
                 onCheckedChange = { CopyEngine.setVerify(it) },
+                enabled = !move,
                 colors = SwitchDefaults.colors(
                     checkedThumbColor = DarkText,
                     checkedTrackColor = Green,
@@ -511,12 +577,19 @@ private fun OptionsPanel(s: UiState) {
 }
 
 @Composable
-private fun Chip(label: String, selected: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
+private fun Chip(
+    label: String,
+    selected: Boolean,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    selectedColor: Color = Blue,
+    onClick: () -> Unit
+) {
     Box(
         modifier
             .clip(RoundedCornerShape(10.dp))
-            .background(if (selected) Blue else Neutral)
-            .clickable(onClick = onClick)
+            .background(if (selected) selectedColor else if (enabled) Neutral else Track)
+            .clickable(enabled = enabled, onClick = onClick)
             .padding(vertical = 10.dp, horizontal = 4.dp),
         contentAlignment = Alignment.Center
     ) {

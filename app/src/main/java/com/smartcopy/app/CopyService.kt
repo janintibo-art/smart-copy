@@ -78,7 +78,8 @@ class CopyService : Service() {
             Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        val title = if (s.paused) "Copie en pause — $pct %" else "Copie en cours — $pct %"
+        val action = if (s.mode == TransferMode.MOVE) "Déplacement" else "Copie"
+        val title = if (s.paused) "$action en pause — $pct %" else "$action en cours — $pct %"
         val text = "${formatBytes(s.copiedBytes)} / ${formatBytes(s.totalBytes)} · ${formatSpeed(s.speed)} · reste ${formatDuration(s.etaMs)}"
         return Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_download)

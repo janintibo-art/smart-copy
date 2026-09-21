@@ -13,6 +13,11 @@ const STATUS = {
   cancelled: 'Annulé',
 };
 
+const MODE_HELP = {
+  copy: 'Les originaux restent en place.',
+  move: "Chaque original est supprimé seulement après une copie vérifiée. Sur le même disque, le déplacement est instantané (aucune donnée recopiée).",
+};
+
 const POLICY_HELP = {
   rename: 'Garde les deux fichiers : la copie devient « nom (1) ».',
   overwrite: "Remplace le fichier existant, seulement une fois la nouvelle copie terminée (et vérifiée si l'option est active).",
@@ -73,8 +78,10 @@ function makeRow(it) {
   bar.append(fill);
   const hash = document.createElement('div');
   hash.className = 'item-hash hidden';
-  row.append(main, size, status, bar, hash);
-  const rec = { data: it, row, size, status, fill, hash };
+  const warning = document.createElement('div');
+  warning.className = 'item-warning hidden';
+  row.append(main, size, status, bar, hash, warning);
+  const rec = { data: it, row, size, status, fill, hash, warning };
   rows.set(it.id, rec);
   paint(rec);
   return row;
@@ -94,11 +101,19 @@ function paint(rec) {
   let label = STATUS[it.status] || it.status;
   if (it.status === 'copying') label = `${(f * 100).toFixed(0)} %`;
   if (verifying) label = `Vérif. ${(f * 100).toFixed(0)} %`;
-  if (it.status === 'done' && it.verified > 0) label = 'Copié · vérifié';
+  if (it.status === 'done') {
+    if (it.instant) label = 'Déplacé (instantané)';
+    else if (it.moved) label = it.verified > 0 ? 'Déplacé · vérifié' : 'Déplacé';
+    else if (it.verified > 0) label = 'Copié · vérifié';
+    f = 1;
+  }
+  if (it.status === 'skipped' && it.moved) label = 'Identique · original supprimé';
   if (it.status === 'failed' && it.error) label = `Échec : ${it.error}`;
   const showHash = (it.status === 'done' || it.status === 'skipped') && it.hash;
   show(rec.hash, !!showHash);
   rec.hash.textContent = showHash ? `SHA-256 ${it.hash}` : '';
+  show(rec.warning, !!it.warning);
+  rec.warning.textContent = it.warning || '';
   rec.status.textContent = label;
   rec.status.title = label;
   rec.fill.style.width = (f * 100).toFixed(1) + '%';
@@ -258,7 +273,19 @@ function renderSummary(s) {
   $('sActive').textContent = `${s.active} / ${s.workers}`;
   $('sFailed').textContent = String(s.filesFailed);
   $('sSkipped').textContent = String(s.filesSkipped);
-  $('optVerify').checked = !!s.verify;
+  const move = s.mode === 'move';
+  for (const b of document.querySelectorAll('#optMode button')) {
+    b.classList.toggle('active', b.dataset.mode === s.mode);
+    b.disabled = s.running;
+  }
+  $('modeHelp').textContent = MODE_HELP[s.mode] || '';
+  $('optVerify').checked = !!s.verify || move;
+  $('optVerify').disabled = move;
+  $('verifyHelp').textContent = move
+    ? "Toujours active en mode Déplacer : l'original n'est supprimé qu'après vérification."
+    : "Relit la copie et compare son empreinte SHA-256 avec celle de l'original.";
+  $('btnStart').textContent = move ? 'Déplacer' : 'Démarrer';
+  $('btnStart').className = move ? 'btn orange' : 'btn green';
   for (const b of document.querySelectorAll('#optPolicy button')) {
     b.classList.toggle('active', b.dataset.policy === s.policy);
   }
@@ -271,7 +298,7 @@ function renderSummary(s) {
     status.textContent = 'En pause';
     status.classList.add('paused');
   } else if (s.running) {
-    status.textContent = 'Copie en cours';
+    status.textContent = s.mode === 'move' ? 'Déplacement en cours' : 'Copie en cours';
     status.classList.add('running');
   } else if (s.filesTotal > 0 && s.filesDone + s.filesSkipped === s.filesTotal) {
     status.textContent = 'Terminé';
@@ -308,6 +335,7 @@ api.onState((state) => {
     Object.assign(rec.data, c);
     paint(rec);
   }
+  lastSummary = state.summary;
   renderSummary(state.summary);
 });
 
@@ -316,7 +344,18 @@ $('btnFolder').addEventListener('click', () => api.pickFolder());
 $('btnDest').addEventListener('click', () => api.pickDest());
 $('btnOpenDest').addEventListener('click', () => api.openDest());
 $('btnAnalyze').addEventListener('click', () => api.analyze());
-$('btnStart').addEventListener('click', () => api.start());
+let lastSummary = null;
+$('btnStart').addEventListener('click', () => {
+  const s = lastSummary;
+  if (s && s.mode === 'move') {
+    const n = s.filesTotal - s.filesDone - s.filesSkipped;
+    const ok = window.confirm(
+      `Déplacer ${n} fichier(s) ?\n\nChaque original sera supprimé une fois sa copie vérifiée. Les fichiers en échec restent à leur place.`
+    );
+    if (!ok) return;
+  }
+  api.start();
+});
 $('btnPause').addEventListener('click', () => api.togglePause());
 $('btnCancel').addEventListener('click', () => api.cancel());
 $('btnClear').addEventListener('click', () => api.clear());
@@ -324,6 +363,9 @@ $('btnMsgOk').addEventListener('click', () => api.clearMessage());
 $('optVerify').addEventListener('change', (e) => api.setOptions({ verify: e.target.checked }));
 for (const b of document.querySelectorAll('#optPolicy button')) {
   b.addEventListener('click', () => api.setOptions({ policy: b.dataset.policy }));
+}
+for (const b of document.querySelectorAll('#optMode button')) {
+  b.addEventListener('click', () => api.setOptions({ mode: b.dataset.mode }));
 }
 
 let dragDepth = 0;

@@ -39,6 +39,14 @@ private const val HISTORY_SIZE = 120
 
 enum class ItemStatus { PENDING, COPYING, VERIFYING, DONE, SKIPPED, FAILED, CANCELLED }
 
+enum class TransferMode(val label: String, val help: String) {
+    COPY("Copier", "Les originaux restent en place."),
+    MOVE(
+        "Déplacer",
+        "Chaque original est supprimé seulement après une copie vérifiée. Sur le même support, le déplacement est instantané."
+    )
+}
+
 enum class ConflictPolicy(val label: String, val help: String) {
     RENAME("Renommer", "Garde les deux fichiers : la copie devient « nom (1) »."),
     OVERWRITE("Remplacer", "Écrase le fichier déjà présent dans la destination."),
@@ -51,8 +59,12 @@ class CopyItem(
     val src: Uri,
     val name: String,
     val size: Long,
-    val relDir: List<String>
+    val relDir: List<String>,
+    val srcParent: Uri? = null
 ) {
+    @Volatile var moved: Boolean = false
+    @Volatile var instant: Boolean = false
+    @Volatile var warning: String? = null
     val copied = AtomicLong(0)
     val verified = AtomicLong(0)
     @Volatile var hash: String? = null
@@ -70,7 +82,10 @@ data class ItemUi(
     val status: ItemStatus,
     val error: String?,
     val verified: Long,
-    val hash: String?
+    val hash: String?,
+    val moved: Boolean,
+    val instant: Boolean,
+    val warning: String?
 )
 
 data class UiState(
@@ -83,6 +98,8 @@ data class UiState(
     val filesDone: Int = 0,
     val filesFailed: Int = 0,
     val filesSkipped: Int = 0,
+    val filesWarned: Int = 0,
+    val mode: TransferMode = TransferMode.COPY,
     val verify: Boolean = true,
     val policy: ConflictPolicy = ConflictPolicy.RENAME,
     val speed: Double = 0.0,
@@ -117,6 +134,9 @@ object CopyEngine {
     private val claimLock = Any()
     private val listingLock = Any()
     private val listings = HashMap<String, HashMap<String, Pair<Uri, Long>>>()
+
+    private data class FolderRec(val tree: Uri, val docId: String, val rel: List<String>)
+    private val sourceFolders = CopyOnWriteArrayList<FolderRec>()
     private val statLock = Any()
 
     @Volatile private var bigBusy = false
@@ -146,7 +166,12 @@ object CopyEngine {
         } catch (e: Exception) {
             ConflictPolicy.RENAME
         }
-        _state.update { it.copy(verify = verify, policy = policy) }
+        val mode = try {
+            TransferMode.valueOf(p.getString("mode", TransferMode.COPY.name) ?: TransferMode.COPY.name)
+        } catch (e: Exception) {
+            TransferMode.COPY
+        }
+        _state.update { it.copy(verify = verify, policy = policy, mode = mode) }
     }
 
     private fun prefs() = app.getSharedPreferences("smartcopy", Context.MODE_PRIVATE)
@@ -156,6 +181,12 @@ object CopyEngine {
     fun setVerify(value: Boolean) {
         _state.update { it.copy(verify = value) }
         prefs().edit().putBoolean("verify", value).apply()
+    }
+
+    fun setMode(value: TransferMode) {
+        if (isRunning) return
+        _state.update { it.copy(mode = value) }
+        prefs().edit().putString("mode", value.name).apply()
     }
 
     fun setPolicy(value: ConflictPolicy) {
@@ -252,6 +283,8 @@ object CopyEngine {
     }
 
     private fun walk(tree: Uri, docId: String, rel: List<String>, out: MutableList<CopyItem>) {
+        sourceFolders.add(FolderRec(tree, docId, rel))
+        val parentUri = DocumentsContract.buildDocumentUriUsingTree(tree, docId)
         val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, docId)
         val projection = arrayOf(
             DocumentsContract.Document.COLUMN_DOCUMENT_ID,
@@ -273,7 +306,7 @@ object CopyEngine {
                         CopyItem(
                             nextId.getAndIncrement(),
                             DocumentsContract.buildDocumentUriUsingTree(tree, id),
-                            name, size, rel
+                            name, size, rel, parentUri
                         )
                     )
                 }
@@ -342,6 +375,21 @@ object CopyEngine {
             message("Rien à copier : ajoutez des fichiers.")
             return
         }
+        if (_state.value.mode == TransferMode.MOVE) {
+            val destId = try {
+                DocumentsContract.getTreeDocumentId(dest)
+            } catch (e: Exception) {
+                ""
+            }
+            val inside = sourceFolders.any { f ->
+                f.rel.size == 1 && f.tree.authority == dest.authority &&
+                    (destId == f.docId || destId.startsWith(f.docId + "/"))
+            }
+            if (inside) {
+                message("Impossible de déplacer un dossier dans lui-même : choisissez une autre destination.")
+                return
+            }
+        }
         paused.value = false
         liveWorkers.set(0)
         synchronized(listingLock) { listings.clear() }
@@ -358,6 +406,7 @@ object CopyEngine {
                     runScope = this
                     spawnWorkers(dest)
                 }
+                if (_state.value.mode == TransferMode.MOVE) cleanupSourceFolders(dest)
             } finally {
                 runScope = null
                 ticker.cancel()
@@ -379,6 +428,7 @@ object CopyEngine {
     fun clear() {
         if (isRunning) return
         items.clear()
+        sourceFolders.clear()
         copiedTotal.set(0)
         synchronized(statLock) {
             elapsedMs = 0L
@@ -443,6 +493,9 @@ object CopyEngine {
     private suspend fun copyOne(item: CopyItem, dest: Uri) {
         val cr = app.contentResolver
         val dirKey = item.relDir.joinToString("/")
+        val settings = _state.value
+        val move = settings.mode == TransferMode.MOVE
+        val verify = settings.verify || move
         var target: Uri? = null
         var createdNew = false
         var truncated = false
@@ -450,8 +503,27 @@ object CopyEngine {
         active.incrementAndGet()
         try {
             val parent = ensureDir(dest, item.relDir)
-            val policy = _state.value.policy
-            val existing = if (policy == ConflictPolicy.RENAME) null else findExisting(dest, parent, dirKey, item.name)
+            val policy = settings.policy
+            val existing = if (policy == ConflictPolicy.RENAME && !move) null else findExisting(dest, parent, dirKey, item.name)
+
+            // Déplacement instantané quand le fournisseur le permet (même support) : aucune donnée recopiée.
+            val srcParent = item.srcParent
+            if (move && existing == null && srcParent != null) {
+                val movedUri = try {
+                    DocumentsContract.moveDocument(cr, item.src, srcParent, parent)
+                } catch (e: Exception) {
+                    null
+                }
+                if (movedUri != null) {
+                    item.instant = true
+                    item.moved = true
+                    rememberFile(dirKey, item.name, movedUri, item.size)
+                    item.status = ItemStatus.DONE
+                    ok = true
+                    return
+                }
+            }
+
             var mode = "w"
             if (existing != null) {
                 when (policy) {
@@ -467,6 +539,7 @@ object CopyEngine {
                             val b = hashUri(existing.first, null)
                             if (a == b) {
                                 item.hash = a
+                                if (move) deleteSource(item)
                                 item.status = ItemStatus.SKIPPED
                                 ok = true
                                 return
@@ -495,7 +568,7 @@ object CopyEngine {
             target = out
             val srcHash = copyStreams(item, out, item.holdsBig, mode) { truncated = true }
             item.hash = srcHash
-            if (_state.value.verify) {
+            if (verify) {
                 item.status = ItemStatus.VERIFYING
                 val dstHash = hashUri(out) { n -> item.verified.addAndGet(n.toLong()) }
                 if (dstHash != srcHash) {
@@ -504,6 +577,7 @@ object CopyEngine {
             }
             ok = true
             item.status = ItemStatus.DONE
+            if (move) deleteSource(item)
         } catch (e: CancellationException) {
             item.status = ItemStatus.CANCELLED
             throw e
@@ -530,6 +604,39 @@ object CopyEngine {
             }
         }
         spawnWorkers(dest)
+    }
+
+    private fun deleteSource(item: CopyItem) {
+        val deleted = try {
+            DocumentsContract.deleteDocument(app.contentResolver, item.src)
+        } catch (e: Exception) {
+            false
+        }
+        if (deleted) {
+            item.moved = true
+        } else {
+            item.warning = "Copié et vérifié, mais l'original n'a pas pu être supprimé."
+        }
+    }
+
+    /** Après un déplacement : recrée à la destination les dossiers restés vides et supprime
+     *  les dossiers source vidés, du plus profond au moins profond. */
+    private suspend fun cleanupSourceFolders(dest: Uri) {
+        val cr = app.contentResolver
+        for (f in sourceFolders.sortedByDescending { it.rel.size }) {
+            currentCoroutineContext().ensureActive()
+            try {
+                val children = DocumentsContract.buildChildDocumentsUriUsingTree(f.tree, f.docId)
+                val count = cr.query(children, arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID), null, null, null)
+                    ?.use { it.count } ?: -1
+                if (count == 0) {
+                    ensureDir(dest, f.rel)
+                    val folderUri = DocumentsContract.buildDocumentUriUsingTree(f.tree, f.docId)
+                    if (DocumentsContract.deleteDocument(cr, folderUri)) sourceFolders.remove(f)
+                }
+            } catch (e: Exception) {
+            }
+        }
     }
 
     private class Chunk(val buf: ByteArray) {
@@ -814,7 +921,9 @@ object CopyEngine {
         var done = 0
         var failed = 0
         var skipped = 0
+        var warned = 0
         for (i in snapshot) {
+            if (i.warning != null) warned++
             when (i.status) {
                 ItemStatus.SKIPPED -> skipped++
                 ItemStatus.DONE -> done++
@@ -822,14 +931,14 @@ object CopyEngine {
                 else -> {
                 }
             }
-            if (i.status != ItemStatus.SKIPPED) total += i.size
+            if (i.status != ItemStatus.SKIPPED && !i.instant) total += i.size
         }
         val copied = copiedTotal.get()
         val running = isRunning
         val ui = snapshot.map {
             ItemUi(
                 it.id, it.name, it.relDir.joinToString(" / "), it.size, it.copied.get(), it.status, it.error,
-                it.verified.get(), it.hash
+                it.verified.get(), it.hash, it.moved, it.instant, it.warning
             )
         }
         synchronized(statLock) {
@@ -850,6 +959,7 @@ object CopyEngine {
                     filesDone = done,
                     filesFailed = failed,
                     filesSkipped = skipped,
+                    filesWarned = warned,
                     speed = sm,
                     avgSpeed = avg,
                     peakSpeed = pk,
@@ -869,12 +979,16 @@ object CopyEngine {
         publish()
         val s = _state.value
         val cancelled = items.any { it.status == ItemStatus.CANCELLED }
+        val move = s.mode == TransferMode.MOVE
+        val verb = if (move) "déplacés" else "copiés"
         val skippedText = if (s.filesSkipped > 0) ", ${s.filesSkipped} ignorés" else ""
-        val verifiedText = if (s.verify && s.filesDone > 0) " et vérifiés" else ""
+        val anyVerified = items.any { it.status == ItemStatus.DONE && it.verified.get() > 0 }
+        val verifiedText = if (anyVerified) " et vérifiés" else ""
+        val warnText = if (s.filesWarned > 0) " Attention : ${s.filesWarned} original(aux) non supprimé(s)." else ""
         val text = when {
-            cancelled -> "Copie annulée. « Démarrer » reprend les fichiers restants."
-            s.filesFailed > 0 -> "Terminé : ${s.filesDone} copiés$skippedText, ${s.filesFailed} en échec (« Démarrer » pour réessayer)."
-            else -> "Terminé : ${s.filesDone} fichier(s) copiés$verifiedText$skippedText."
+            cancelled -> "Transfert annulé. « Démarrer » reprend les fichiers restants."
+            s.filesFailed > 0 -> "Terminé : ${s.filesDone} $verb$skippedText, ${s.filesFailed} en échec (« Démarrer » pour réessayer).$warnText"
+            else -> "Terminé : ${s.filesDone} fichier(s) $verb$verifiedText$skippedText.$warnText"
         }
         _state.update {
             it.copy(running = false, paused = false, speed = 0.0, etaMs = -1L, activeStreams = 0, message = text)

@@ -71,6 +71,49 @@ async function writeAll(fh, buf, len) {
 }
 
 const POLICIES = ['rename', 'overwrite', 'skip', 'sync'];
+const MODES = ['copy', 'move'];
+
+function samePath(a, b) {
+  const x = path.resolve(a);
+  const y = path.resolve(b);
+  return process.platform === 'win32' ? x.toLowerCase() === y.toLowerCase() : x === y;
+}
+
+function isInside(root, p) {
+  const rel = path.relative(root, p);
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+async function freeName(target) {
+  const dir = path.dirname(target);
+  const ext = path.extname(target);
+  const base = path.basename(target, ext);
+  for (let n = 1; n < 10000; n++) {
+    const candidate = path.join(dir, `${base} (${n})${ext}`);
+    if (!(await statOrNull(candidate))) return candidate;
+  }
+  throw new Error('trop de fichiers portant le même nom');
+}
+
+/** Après un déplacement : recrée à la destination les dossiers vidés (structure conservée,
+ *  dossiers vides compris) puis supprime les dossiers source vides, du plus profond au moins profond. */
+async function removeEmptyDirs(src, dst) {
+  let entries;
+  try {
+    entries = await fsp.readdir(src, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const e of entries) {
+    if (e.isDirectory()) await removeEmptyDirs(path.join(src, e.name), path.join(dst, e.name));
+  }
+  try {
+    if ((await fsp.readdir(src)).length === 0) {
+      await fsp.mkdir(dst, { recursive: true });
+      await fsp.rmdir(src);
+    }
+  } catch {}
+}
 
 async function statOrNull(p) {
   try {
@@ -91,6 +134,9 @@ function itemView(it) {
     hash: it.hash,
     status: it.status,
     error: it.error,
+    moved: it.moved,
+    instant: it.instant,
+    warning: it.warning,
   };
 }
 
@@ -130,6 +176,9 @@ class CopyEngine extends EventEmitter {
 
     this.verify = true;
     this.policy = 'rename';
+    this.mode = 'copy';
+    this.sourceRoots = [];
+    this.completing = false;
   }
 
   // ---------- Options ----------
@@ -137,11 +186,12 @@ class CopyEngine extends EventEmitter {
   setOptions(opts) {
     if (opts && typeof opts.verify === 'boolean') this.verify = opts.verify;
     if (opts && POLICIES.includes(opts.policy)) this.policy = opts.policy;
+    if (opts && MODES.includes(opts.mode) && !this.running) this.mode = opts.mode;
     this.emitState();
   }
 
   getOptions() {
-    return { verify: this.verify, policy: this.policy };
+    return { verify: this.verify, policy: this.policy, mode: this.mode };
   }
 
   // ---------- Destination ----------
@@ -163,7 +213,10 @@ class CopyEngine extends EventEmitter {
     for (const p of paths) {
       try {
         const st = await fsp.stat(p);
-        if (st.isDirectory()) await this.walk(p, [path.basename(p)], found);
+        if (st.isDirectory()) {
+          this.sourceRoots.push({ src: p, name: path.basename(p) });
+          await this.walk(p, [path.basename(p)], found);
+        }
         else if (st.isFile()) found.push(this.makeItem(p, st, []));
       } catch (e) {
         this.message = `Ignoré : ${p} (${e.code || e.message})`;
@@ -208,6 +261,9 @@ class CopyEngine extends EventEmitter {
       status: 'pending',
       error: null,
       holdsBig: false,
+      moved: false,
+      instant: false,
+      warning: null,
     };
   }
 
@@ -260,6 +316,10 @@ class CopyEngine extends EventEmitter {
       this.message = 'Rien à copier : ajoutez des fichiers.';
       return this.emitState();
     }
+    if (this.mode === 'move' && this.sourceRoots.some((r) => isInside(r.src, this.dest))) {
+      this.message = 'Impossible de déplacer un dossier dans lui-même : choisissez une autre destination.';
+      return this.emitState();
+    }
     if (!this.analysis) await this.analyze();
 
     this.running = true;
@@ -270,8 +330,21 @@ class CopyEngine extends EventEmitter {
     this.lastBytes = this.copied;
     this.timer = setInterval(() => this.tick(), 250);
     this.spawnWorkers();
-    if (this.liveWorkers === 0) this.finish();
+    if (this.liveWorkers === 0) this.complete();
     this.emitState();
+  }
+
+  async complete() {
+    if (this.completing) return;
+    this.completing = true;
+    try {
+      if (this.mode === 'move' && !this.cancelled) {
+        for (const r of this.sourceRoots) await removeEmptyDirs(r.src, path.join(this.dest, r.name));
+      }
+    } catch {}
+    this.completing = false;
+    if (this.liveWorkers > 0) return;
+    this.finish();
   }
 
   togglePause() {
@@ -292,6 +365,7 @@ class CopyEngine extends EventEmitter {
   clear() {
     if (this.running) return;
     this.items = [];
+    this.sourceRoots = [];
     this.firstPending = 0;
     this.copied = 0;
     this.elapsedMs = 0;
@@ -329,7 +403,7 @@ class CopyEngine extends EventEmitter {
         .catch(() => {})
         .finally(() => {
           this.liveWorkers--;
-          if (this.liveWorkers === 0 && this.running) this.finish();
+          if (this.liveWorkers === 0 && this.running) this.complete();
         });
     }
   }
@@ -365,32 +439,57 @@ class CopyEngine extends EventEmitter {
   async copyOne(it) {
     let out = null;
     let ok = false;
+    const move = this.mode === 'move';
+    const verify = this.verify || move;
     this.active++;
     try {
       const dir = path.join(this.dest, ...it.rel);
       await fsp.mkdir(dir, { recursive: true });
       const wanted = path.join(dir, it.name);
+      if (move && samePath(path.dirname(it.src), dir)) {
+        it.status = 'skipped';
+        ok = true;
+        return;
+      }
       const policy = this.policy;
-      const existing = policy === 'rename' ? null : await statOrNull(wanted);
+      const existing = policy === 'rename' && !move ? null : await statOrNull(wanted);
+      const exists = !!(existing && existing.isFile());
 
-      if (existing && existing.isFile()) {
-        if (policy === 'skip') {
+      if (exists && policy === 'skip') {
+        it.status = 'skipped';
+        ok = true;
+        return;
+      }
+      if (exists && policy === 'sync' && existing.size === it.size) {
+        this.setStatus(it, 'verifying');
+        const a = await this.hashFile(it.src, null);
+        const b = await this.hashFile(wanted, null);
+        if (a === b) {
+          it.hash = a;
+          if (move) await this.deleteSource(it);
           it.status = 'skipped';
           ok = true;
           return;
         }
-        if (policy === 'sync' && existing.size === it.size) {
-          this.setStatus(it, 'verifying');
-          const a = await this.hashFile(it.src, null);
-          const b = await this.hashFile(wanted, null);
-          if (a === b) {
-            it.hash = a;
-            it.status = 'skipped';
-            ok = true;
-            return;
-          }
-          this.setStatus(it, 'copying');
+        this.setStatus(it, 'copying');
+      }
+
+      // Déplacement instantané sur le même disque : simple changement de dossier, aucune donnée recopiée.
+      if (move) {
+        const target = existing && (policy === 'rename' || !exists) ? await freeName(wanted) : wanted;
+        try {
+          await fsp.rename(it.src, target);
+          it.instant = true;
+          it.moved = true;
+          it.status = 'done';
+          ok = true;
+          return;
+        } catch {
+          // autre disque (EXDEV) ou refus : copie + vérification + suppression
         }
+      }
+
+      if (exists && policy !== 'rename') {
         const tmp = `${wanted}.smartcopy-part`;
         out = { fh: await fsp.open(tmp, 'w'), file: tmp, finalName: wanted };
       } else {
@@ -406,7 +505,7 @@ class CopyEngine extends EventEmitter {
       }
       it.hash = srcHash;
 
-      if (this.verify) {
+      if (verify) {
         this.setStatus(it, 'verifying');
         const dstHash = await this.hashFile(out.file, (n) => {
           it.verified += n;
@@ -421,6 +520,7 @@ class CopyEngine extends EventEmitter {
       await fsp.utimes(out.file, it.atime, it.mtime).catch(() => {});
       ok = true;
       it.status = 'done';
+      if (move) await this.deleteSource(it);
     } catch (e) {
       if (e instanceof CancelError || this.cancelled) it.status = 'cancelled';
       else {
@@ -442,6 +542,23 @@ class CopyEngine extends EventEmitter {
       this.dirty.add(it);
     }
     this.spawnWorkers();
+  }
+
+  async deleteSource(it) {
+    try {
+      await fsp.unlink(it.src);
+      it.moved = true;
+    } catch (e) {
+      if (e.code === 'EPERM' || e.code === 'EACCES') {
+        try {
+          await fsp.chmod(it.src, 0o666);
+          await fsp.unlink(it.src);
+          it.moved = true;
+          return;
+        } catch {}
+      }
+      it.warning = `Copié et vérifié, mais l'original n'a pas pu être supprimé (${e.code || e.message}).`;
+    }
   }
 
   setStatus(it, status) {
@@ -543,11 +660,15 @@ class CopyEngine extends EventEmitter {
     this.running = false;
     this.smoothed = 0;
     const s = this.summary();
+    const move = this.mode === 'move';
+    const verb = move ? 'déplacés' : 'copiés';
     const skippedText = s.filesSkipped ? `, ${s.filesSkipped} ignorés` : '';
-    const verifiedText = this.verify && s.filesDone ? ' et vérifiés' : '';
-    if (this.cancelled) this.message = 'Copie annulée. « Démarrer » reprend les fichiers restants.';
-    else if (s.filesFailed) this.message = `Terminé : ${s.filesDone} copiés${skippedText}, ${s.filesFailed} en échec (« Démarrer » pour réessayer).`;
-    else this.message = `Terminé : ${s.filesDone} fichier(s) copiés${verifiedText}${skippedText}.`;
+    const anyVerified = this.items.some((i) => i.status === 'done' && i.verified > 0);
+    const verifiedText = anyVerified ? ' et vérifiés' : '';
+    const warnText = s.filesWarned ? ` Attention : ${s.filesWarned} original(aux) non supprimé(s).` : '';
+    if (this.cancelled) this.message = 'Transfert annulé. « Démarrer » reprend les fichiers restants.';
+    else if (s.filesFailed) this.message = `Terminé : ${s.filesDone} ${verb}${skippedText}, ${s.filesFailed} en échec (« Démarrer » pour réessayer).${warnText}`;
+    else this.message = `Terminé : ${s.filesDone} fichier(s) ${verb}${verifiedText}${skippedText}.${warnText}`;
     this.cancelled = false;
     this.emitState();
   }
@@ -557,12 +678,14 @@ class CopyEngine extends EventEmitter {
     let done = 0;
     let failed = 0;
     let skipped = 0;
+    let warned = 0;
     for (const it of this.items) {
+      if (it.warning) warned++;
       if (it.status === 'skipped') {
         skipped++;
         continue;
       }
-      total += it.size;
+      if (!it.instant) total += it.size;
       if (it.status === 'done') done++;
       else if (it.status === 'failed') failed++;
     }
@@ -578,8 +701,10 @@ class CopyEngine extends EventEmitter {
       filesDone: done,
       filesFailed: failed,
       filesSkipped: skipped,
+      filesWarned: warned,
       verify: this.verify,
       policy: this.policy,
+      mode: this.mode,
       speed: this.running ? this.smoothed : 0,
       avg,
       peak: this.peak,

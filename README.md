@@ -8,8 +8,8 @@ Chaque envoi sur `main` compile automatiquement les deux versions. Elles se trou
 dans l'onglet **Releases** du dépôt :
 
 - `SmartCopy-N.apk` : Android 8.0 et plus
-- `SmartCopy-3.0.0-portable.exe` : Windows, sans installation
-- `SmartCopy-3.0.0-installation.exe` : Windows, avec installation
+- `SmartCopy-4.0.0-portable.exe` : Windows, sans installation
+- `SmartCopy-4.0.0-installation.exe` : Windows, avec installation
 
 ## Ce que fait l'application
 
@@ -32,6 +32,11 @@ dans l'onglet **Releases** du dépôt :
   « si différent » (les fichiers identiques, comparés par empreinte, sont ignorés ; les autres
   remplacés). Sur Windows, le remplacement n'a lieu qu'une fois la nouvelle copie terminée et
   vérifiée : l'original n'est jamais abîmé par une copie ratée.
+- **Mode Déplacer** : chaque original est supprimé seulement après une copie vérifiée
+  (vérification toujours active dans ce mode). Sur le même support, le déplacement est
+  instantané (simple changement de dossier, aucune donnée recopiée). Les dossiers vidés à la
+  source sont supprimés et la structure est recréée à la destination, dossiers vides compris.
+  Confirmation avant de lancer, refus de déplacer un dossier dans lui-même.
 - Pause, reprise, annulation (le fichier incomplet est supprimé), nouvelle tentative des échecs.
 - Android : la copie continue écran éteint, avec la progression dans une notification.
 - Windows : glisser-déposer, dates des fichiers conservées.

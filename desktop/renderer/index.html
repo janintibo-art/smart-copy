@@ -63,10 +63,18 @@
     <section class="card wide" id="optionsCard">
       <div class="card-title">Options</div>
       <div class="options">
+        <div class="span2">
+          <div class="opt-title">Mode</div>
+          <div class="segmented two" id="optMode">
+            <button data-mode="copy">Copier</button>
+            <button data-mode="move" class="warn">Déplacer</button>
+          </div>
+          <div id="modeHelp" class="muted small"></div>
+        </div>
         <label class="toggle-row">
           <div>
             <div class="opt-title">Vérifier chaque copie</div>
-            <div class="muted small">Relit la copie et compare son empreinte SHA-256 avec celle de l'original.</div>
+            <div id="verifyHelp" class="muted small">Relit la copie et compare son empreinte SHA-256 avec celle de l'original.</div>
           </div>
           <input type="checkbox" id="optVerify" class="switch" />
         </label>
