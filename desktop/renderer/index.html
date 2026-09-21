@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:" />
+  <title>Smart Copy</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="top">
+    <div>
+      <h1>Smart Copy</h1>
+      <p>Copie intelligente · débit optimisé</p>
+    </div>
+    <div class="top-actions">
+      <button id="btnFiles" class="btn blue">+ Fichiers</button>
+      <button id="btnFolder" class="btn blue">+ Dossier</button>
+    </div>
+  </header>
+
+  <main class="grid">
+    <section class="card" id="destCard">
+      <div class="card-title">Destination</div>
+      <div class="row">
+        <div class="grow">
+          <div id="destName" class="big-line">Aucun dossier choisi</div>
+          <div id="destKind" class="accent-blue small"></div>
+          <div id="destFree" class="muted small"></div>
+          <div class="bar thin"><div id="destBar" class="fill blue"></div></div>
+        </div>
+        <div class="col-actions">
+          <button id="btnDest" class="btn blue">Choisir</button>
+          <button id="btnOpenDest" class="btn neutral">Ouvrir</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="card" id="analysisCard">
+      <div class="card-title">Analyse des mémoires</div>
+      <div id="analysisIntro" class="muted small">
+        Mesure le débit réel d'écriture de la destination pour plusieurs tailles de bloc (cache vidé),
+        la vitesse de lecture de la source, la latence des petits fichiers, et identifie les supports
+        (SSD NVMe, SATA, disque dur, USB, carte SD). Lancée automatiquement au démarrage si besoin.
+      </div>
+      <div id="analysisStep" class="accent-orange hidden"></div>
+      <div id="analysisResult" class="hidden">
+        <div class="stats">
+          <div class="stat"><span>Lecture source</span><b id="aRead" class="accent-green"></b></div>
+          <div class="stat"><span>Écriture destination</span><b id="aWrite" class="accent-blue"></b></div>
+          <div class="stat"><span>Bloc optimal</span><b id="aBlock" class="accent-orange"></b></div>
+          <div class="stat"><span>Petit fichier</span><b id="aLatency"></b></div>
+          <div class="stat"><span>Flux parallèles</span><b id="aWorkers"></b></div>
+        </div>
+        <div id="aSource" class="muted small"></div>
+        <div id="aDest" class="muted small"></div>
+        <div id="aSame" class="accent-orange small hidden">Source et destination sur le même disque : les gros fichiers passent un par un.</div>
+        <div class="muted small spaced">Débit d'écriture selon la taille de bloc</div>
+        <div id="blockChart" class="block-chart"></div>
+      </div>
+      <button id="btnAnalyze" class="btn green full">Analyser</button>
+    </section>
+
+    <section class="card wide" id="progressCard">
+      <div class="progress-head">
+        <div class="pct"><span id="pct">0,0</span><small> %</small></div>
+        <div id="status" class="status">Prêt</div>
+      </div>
+      <div class="bar big"><div id="mainBar" class="fill green"></div></div>
+      <div id="bytesLine" class="muted">0 o sur 0 o</div>
+      <div class="stats six">
+        <div class="stat"><span>Vitesse</span><b id="sSpeed" class="accent-green">0 o/s</b></div>
+        <div class="stat"><span>Moyenne</span><b id="sAvg" class="accent-blue">0 o/s</b></div>
+        <div class="stat"><span>Pic</span><b id="sPeak" class="accent-orange">0 o/s</b></div>
+        <div class="stat"><span>Restant</span><b id="sEta">--:--</b></div>
+        <div class="stat"><span>Écoulé</span><b id="sElapsed">00:00</b></div>
+        <div class="stat"><span>Fichiers</span><b id="sFiles">0 / 0</b></div>
+        <div class="stat"><span>Bloc actuel</span><b id="sBlock">—</b></div>
+        <div class="stat"><span>Flux actifs</span><b id="sActive">0</b></div>
+        <div class="stat"><span>Échecs</span><b id="sFailed">0</b></div>
+      </div>
+      <div class="chart-wrap">
+        <canvas id="chart"></canvas>
+        <div id="chartMax" class="chart-max"></div>
+        <div id="chartEmpty" class="chart-empty">Graphique du débit en direct</div>
+      </div>
+      <div class="controls">
+        <button id="btnStart" class="btn green">Démarrer</button>
+        <button id="btnPause" class="btn orange hidden">Pause</button>
+        <button id="btnCancel" class="btn red hidden">Annuler</button>
+        <button id="btnClear" class="btn neutral">Vider la liste</button>
+      </div>
+      <div id="message" class="message hidden">
+        <span id="messageText"></span>
+        <button id="btnMsgOk" class="link">OK</button>
+      </div>
+    </section>
+
+    <section class="card wide">
+      <div class="card-title">File d'attente <span id="queueCount"></span></div>
+      <div id="queueHint" class="muted small">Glissez-déposez des fichiers ou des dossiers n'importe où dans la fenêtre. Vous pouvez en ajouter pendant la copie : ils passent à la suite.</div>
+      <div id="queue" class="queue"></div>
+    </section>
+  </main>
+
+  <div id="drop" class="drop"><div>Déposez pour ajouter à la file</div></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

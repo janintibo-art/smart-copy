@@ -1,0 +1,47 @@
+{
+  "name": "smart-copy",
+  "productName": "Smart Copy",
+  "version": "2.0.0",
+  "description": "Copie intelligente de fichiers avec optimisation du débit",
+  "author": "janintibo-art",
+  "license": "MIT",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win --publish never"
+  },
+  "devDependencies": {
+    "electron": "^31.7.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.smartcopy.app",
+    "productName": "Smart Copy",
+    "files": [
+      "main.js",
+      "preload.js",
+      "analyzer.js",
+      "engine.js",
+      "format.js",
+      "renderer/**/*"
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": [
+        { "target": "portable", "arch": ["x64"] },
+        { "target": "nsis", "arch": ["x64"] }
+      ]
+    },
+    "portable": {
+      "artifactName": "SmartCopy-${version}-portable.exe"
+    },
+    "nsis": {
+      "artifactName": "SmartCopy-${version}-installation.exe",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    }
+  }
+}

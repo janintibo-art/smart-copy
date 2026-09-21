@@ -1,4 +1,8 @@
-node_modules/
 .gradle/
 build/
-.DS_Store
+app/build/
+local.properties
+.idea/
+*.iml
+desktop/node_modules/
+desktop/dist/
