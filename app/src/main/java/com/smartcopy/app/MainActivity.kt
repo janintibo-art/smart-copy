@@ -1,9 +1,11 @@
 package com.smartcopy.app
 
 import android.Manifest
+import android.app.PictureInPictureParams
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.util.Rational
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -77,14 +79,60 @@ private val Muted = Color(0xFF8A94A8)
 private val DarkText = Color(0xFF07101A)
 
 class MainActivity : ComponentActivity() {
+
+    private var inPip by mutableStateOf(false)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         CopyEngine.init(applicationContext)
+        addOnPictureInPictureModeChangedListener { info -> inPip = info.isInPictureInPictureMode }
         setContent {
             SmartCopyTheme {
-                SmartCopyScreen()
+                if (inPip) {
+                    PipScreen()
+                } else {
+                    SmartCopyScreen(
+                        onRunningChanged = { running -> updatePip(running) },
+                        onMini = { enterMini() }
+                    )
+                }
             }
         }
+    }
+
+    private fun pipSupported(): Boolean =
+        packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)
+
+    private fun pipParams(autoEnter: Boolean): PictureInPictureParams {
+        val builder = PictureInPictureParams.Builder().setAspectRatio(Rational(16, 10))
+        if (Build.VERSION.SDK_INT >= 31) {
+            builder.setAutoEnterEnabled(autoEnter)
+            builder.setSeamlessResizeEnabled(false)
+        }
+        return builder.build()
+    }
+
+    /** Pendant une copie, quitter l'appli la réduit automatiquement en mini-fenêtre (Android 12+). */
+    private fun updatePip(running: Boolean) {
+        if (!pipSupported()) return
+        try {
+            setPictureInPictureParams(pipParams(running))
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun enterMini() {
+        if (!pipSupported()) return
+        try {
+            enterPictureInPictureMode(pipParams(CopyEngine.state.value.running))
+        } catch (e: Exception) {
+        }
+    }
+
+    /** Android 8 à 11 : pas de réduction automatique native, on la déclenche en quittant l'appli. */
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        if (Build.VERSION.SDK_INT < 31 && CopyEngine.state.value.running) enterMini()
     }
 }
 
@@ -105,9 +153,11 @@ fun SmartCopyTheme(content: @Composable () -> Unit) {
 }
 
 @Composable
-fun SmartCopyScreen() {
+fun SmartCopyScreen(onRunningChanged: (Boolean) -> Unit = {}, onMini: () -> Unit = {}) {
     val s by CopyEngine.state.collectAsState()
     val context = LocalContext.current
+
+    LaunchedEffect(s.running) { onRunningChanged(s.running) }
 
     val pickFiles = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         if (uris.isNotEmpty()) CopyEngine.addFiles(uris)
@@ -178,6 +228,7 @@ fun SmartCopyScreen() {
                 s,
                 onAddFiles = { pickFiles.launch(arrayOf("*/*")) },
                 onAddFolder = { pickFolder.launch(null) },
+                onMini = onMini,
                 onStart = {
                     if (s.mode == TransferMode.MOVE) {
                         confirmMove = true
@@ -506,7 +557,13 @@ private fun statusColor(s: UiState): Color = when {
 }
 
 @Composable
-private fun Controls(s: UiState, onAddFiles: () -> Unit, onAddFolder: () -> Unit, onStart: () -> Unit) {
+private fun Controls(
+    s: UiState,
+    onAddFiles: () -> Unit,
+    onAddFolder: () -> Unit,
+    onMini: () -> Unit,
+    onStart: () -> Unit
+) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             ActionButton("+ Fichiers", Blue, modifier = Modifier.weight(1f), onClick = onAddFiles)
@@ -536,6 +593,15 @@ private fun Controls(s: UiState, onAddFiles: () -> Unit, onAddFolder: () -> Unit
                 ) { CopyEngine.togglePause() }
                 ActionButton("Annuler", Red, modifier = Modifier.weight(1f)) { CopyEngine.cancel() }
             }
+        }
+        if (s.running) {
+            ActionButton(
+                "Mini-fenêtre",
+                Neutral,
+                contentColor = TextMain,
+                modifier = Modifier.fillMaxWidth(),
+                onClick = onMini
+            )
         }
         if (s.running) {
             Text(
@@ -813,11 +879,14 @@ private fun BlockChart(results: List<BlockResult>, best: Int) {
 }
 
 @Composable
-private fun SpeedChart(history: List<Float>) {
+private fun SpeedChart(
+    history: List<Float>,
+    modifier: Modifier = Modifier
+        .fillMaxWidth()
+        .height(120.dp)
+) {
     Box(
-        Modifier
-            .fillMaxWidth()
-            .height(120.dp)
+        modifier
             .clip(RoundedCornerShape(12.dp))
             .background(CardBg2)
     ) {
@@ -871,5 +940,56 @@ private fun SpeedChart(history: List<Float>) {
                     .padding(6.dp)
             )
         }
+    }
+}
+
+/** Contenu de la mini-fenêtre flottante (image dans l'image). */
+@Composable
+fun PipScreen() {
+    val s by CopyEngine.state.collectAsState()
+    val frac = if (s.totalBytes > 0) (s.copiedBytes.toDouble() / s.totalBytes.toDouble()).toFloat().coerceIn(0f, 1f) else 0f
+    val status = when {
+        s.running && s.paused -> "En pause"
+        s.running -> if (s.mode == TransferMode.MOVE) "Déplacement" else "Copie"
+        s.filesFailed > 0 -> "${s.filesFailed} échec(s)"
+        else -> "Terminé"
+    }
+    Column(
+        Modifier
+            .fillMaxSize()
+            .background(Bg)
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        Row(verticalAlignment = Alignment.Bottom) {
+            Text(
+                String.format(Locale.FRANCE, "%.1f %%", frac * 100f),
+                color = TextMain,
+                fontSize = 22.sp,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1
+            )
+            Spacer(Modifier.weight(1f))
+            Text(status, color = statusColor(s), fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+        }
+        Bar(frac, Green, 6.dp)
+        Text(
+            "${formatSpeed(s.speed)} · reste ${formatDuration(s.etaMs)}",
+            color = TextMain,
+            fontSize = 11.sp,
+            maxLines = 1
+        )
+        Text(
+            "${s.filesDone} / ${s.filesTotal} fichiers · ${formatBytes(s.copiedBytes)}",
+            color = Muted,
+            fontSize = 10.sp,
+            maxLines = 1
+        )
+        SpeedChart(
+            s.history,
+            Modifier
+                .fillMaxWidth()
+                .weight(1f)
+        )
     }
 }

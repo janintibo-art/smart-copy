@@ -48,6 +48,10 @@ dans l'onglet **Releases** du dépôt :
   et pic, destination, et liste des échecs.
 - Pause, reprise, annulation (le fichier incomplet est supprimé), nouvelle tentative des échecs.
 - Android : la copie continue écran éteint, avec la progression dans une notification.
+- Android : **mini-fenêtre flottante** (image dans l'image). Pendant un transfert, quitter
+  l'appli la réduit automatiquement en petite fenêtre par-dessus les autres applis
+  (pourcentage, vitesse, temps restant, fichiers, graphique du débit) ; bouton
+  « Mini-fenêtre » pour la réduire à la demande.
 - Windows : glisser-déposer, dates des fichiers conservées.
 
 ## Structure
