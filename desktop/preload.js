@@ -15,6 +15,7 @@ contextBridge.exposeInMainWorld('api', {
       return '';
     }
   },
+  setOptions: (opts) => ipcRenderer.invoke('set-options', opts),
   analyze: () => ipcRenderer.invoke('analyze'),
   start: () => ipcRenderer.invoke('start'),
   togglePause: () => ipcRenderer.invoke('toggle-pause'),

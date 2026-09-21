@@ -3,6 +3,7 @@
 const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
+const crypto = require('crypto');
 const EventEmitter = require('events');
 const { analyze, describeDrive } = require('./analyzer');
 const { fmtBytes } = require('./format');
@@ -69,6 +70,16 @@ async function writeAll(fh, buf, len) {
   }
 }
 
+const POLICIES = ['rename', 'overwrite', 'skip', 'sync'];
+
+async function statOrNull(p) {
+  try {
+    return await fsp.stat(p);
+  } catch {
+    return null;
+  }
+}
+
 function itemView(it) {
   return {
     id: it.id,
@@ -76,6 +87,8 @@ function itemView(it) {
     rel: it.rel.join(' / '),
     size: it.size,
     copied: it.copied,
+    verified: it.verified,
+    hash: it.hash,
     status: it.status,
     error: it.error,
   };
@@ -114,6 +127,21 @@ class CopyEngine extends EventEmitter {
     this.lastBytes = 0;
     this.half = false;
     this.dirty = new Set();
+
+    this.verify = true;
+    this.policy = 'rename';
+  }
+
+  // ---------- Options ----------
+
+  setOptions(opts) {
+    if (opts && typeof opts.verify === 'boolean') this.verify = opts.verify;
+    if (opts && POLICIES.includes(opts.policy)) this.policy = opts.policy;
+    this.emitState();
+  }
+
+  getOptions() {
+    return { verify: this.verify, policy: this.policy };
   }
 
   // ---------- Destination ----------
@@ -175,6 +203,8 @@ class CopyEngine extends EventEmitter {
       mtime: st.mtime,
       rel,
       copied: 0,
+      verified: 0,
+      hash: null,
       status: 'pending',
       error: null,
       holdsBig: false,
@@ -221,6 +251,7 @@ class CopyEngine extends EventEmitter {
       if (it.status === 'failed' || it.status === 'cancelled') {
         it.status = 'pending';
         it.error = null;
+        it.verified = 0;
         this.dirty.add(it);
       }
     }
@@ -338,12 +369,54 @@ class CopyEngine extends EventEmitter {
     try {
       const dir = path.join(this.dest, ...it.rel);
       await fsp.mkdir(dir, { recursive: true });
-      out = await openUnique(path.join(dir, it.name));
+      const wanted = path.join(dir, it.name);
+      const policy = this.policy;
+      const existing = policy === 'rename' ? null : await statOrNull(wanted);
+
+      if (existing && existing.isFile()) {
+        if (policy === 'skip') {
+          it.status = 'skipped';
+          ok = true;
+          return;
+        }
+        if (policy === 'sync' && existing.size === it.size) {
+          this.setStatus(it, 'verifying');
+          const a = await this.hashFile(it.src, null);
+          const b = await this.hashFile(wanted, null);
+          if (a === b) {
+            it.hash = a;
+            it.status = 'skipped';
+            ok = true;
+            return;
+          }
+          this.setStatus(it, 'copying');
+        }
+        const tmp = `${wanted}.smartcopy-part`;
+        out = { fh: await fsp.open(tmp, 'w'), file: tmp, finalName: wanted };
+      } else {
+        out = await openUnique(wanted);
+      }
+
+      let srcHash;
       try {
         if (it.holdsBig) await out.fh.truncate(it.size).catch(() => {});
-        await this.copyFile(it, out.fh, it.holdsBig);
+        srcHash = await this.copyFile(it, out.fh, it.holdsBig);
       } finally {
         await out.fh.close().catch(() => {});
+      }
+      it.hash = srcHash;
+
+      if (this.verify) {
+        this.setStatus(it, 'verifying');
+        const dstHash = await this.hashFile(out.file, (n) => {
+          it.verified += n;
+          this.dirty.add(it);
+        });
+        if (dstHash !== srcHash) throw new Error('empreinte différente : la copie est corrompue');
+      }
+      if (out.finalName) {
+        await fsp.rename(out.file, out.finalName);
+        out.file = out.finalName;
       }
       await fsp.utimes(out.file, it.atime, it.mtime).catch(() => {});
       ok = true;
@@ -363,6 +436,7 @@ class CopyEngine extends EventEmitter {
       if (!ok) {
         this.copied -= it.copied;
         it.copied = 0;
+        it.verified = 0;
         if (out) await fsp.unlink(out.file).catch(() => {});
       }
       this.dirty.add(it);
@@ -370,9 +444,38 @@ class CopyEngine extends EventEmitter {
     this.spawnWorkers();
   }
 
-  /** Copie en pipeline : lecture du bloc suivant pendant l'écriture du bloc courant. */
+  setStatus(it, status) {
+    it.status = status;
+    this.dirty.add(it);
+  }
+
+  /** Relit un fichier et calcule son empreinte SHA-256 (respecte pause et annulation). */
+  async hashFile(file, onBytes) {
+    const fh = await fsp.open(file, 'r');
+    const hash = crypto.createHash('sha256');
+    const buf = Buffer.allocUnsafe(4 * MiB);
+    let pos = 0;
+    try {
+      for (;;) {
+        await this.waitIfPaused();
+        if (this.cancelled) throw new CancelError();
+        const { bytesRead } = await fh.read(buf, 0, buf.length, pos);
+        if (!bytesRead) break;
+        hash.update(buf.subarray(0, bytesRead));
+        pos += bytesRead;
+        if (onBytes) onBytes(bytesRead);
+      }
+    } finally {
+      await fh.close().catch(() => {});
+    }
+    return hash.digest('hex');
+  }
+
+  /** Copie en pipeline : lecture du bloc suivant pendant l'écriture du bloc courant,
+   *  empreinte SHA-256 de la source calculée pendant l'écriture. */
   async copyFile(it, outFh, big) {
     const inFh = await fsp.open(it.src, 'r');
+    const hash = crypto.createHash('sha256');
     let pendingRead = null;
     try {
       const cap = big ? MAX_BLOCK : Math.max(64 * 1024, Math.min(this.blockSize, it.size || 1));
@@ -392,7 +495,9 @@ class CopyEngine extends EventEmitter {
         pos += bytesRead;
         idx ^= 1;
         pendingRead = inFh.read(bufs[idx], 0, want(), pos);
-        await writeAll(outFh, current, bytesRead);
+        const writing = writeAll(outFh, current, bytesRead);
+        hash.update(current.subarray(0, bytesRead));
+        await writing;
         it.copied += bytesRead;
         this.copied += bytesRead;
         this.dirty.add(it);
@@ -409,6 +514,7 @@ class CopyEngine extends EventEmitter {
       if (pendingRead) await pendingRead.catch(() => {});
       await inFh.close().catch(() => {});
     }
+    return hash.digest('hex');
   }
 
   // ---------- Statistiques ----------
@@ -437,9 +543,11 @@ class CopyEngine extends EventEmitter {
     this.running = false;
     this.smoothed = 0;
     const s = this.summary();
+    const skippedText = s.filesSkipped ? `, ${s.filesSkipped} ignorés` : '';
+    const verifiedText = this.verify && s.filesDone ? ' et vérifiés' : '';
     if (this.cancelled) this.message = 'Copie annulée. « Démarrer » reprend les fichiers restants.';
-    else if (s.filesFailed) this.message = `Terminé : ${s.filesDone} copiés, ${s.filesFailed} en échec (« Démarrer » pour réessayer).`;
-    else this.message = `Terminé : ${s.filesDone} fichier(s) copiés.`;
+    else if (s.filesFailed) this.message = `Terminé : ${s.filesDone} copiés${skippedText}, ${s.filesFailed} en échec (« Démarrer » pour réessayer).`;
+    else this.message = `Terminé : ${s.filesDone} fichier(s) copiés${verifiedText}${skippedText}.`;
     this.cancelled = false;
     this.emitState();
   }
@@ -448,7 +556,12 @@ class CopyEngine extends EventEmitter {
     let total = 0;
     let done = 0;
     let failed = 0;
+    let skipped = 0;
     for (const it of this.items) {
+      if (it.status === 'skipped') {
+        skipped++;
+        continue;
+      }
       total += it.size;
       if (it.status === 'done') done++;
       else if (it.status === 'failed') failed++;
@@ -464,6 +577,9 @@ class CopyEngine extends EventEmitter {
       filesTotal: this.items.length,
       filesDone: done,
       filesFailed: failed,
+      filesSkipped: skipped,
+      verify: this.verify,
+      policy: this.policy,
       speed: this.running ? this.smoothed : 0,
       avg,
       peak: this.peak,

@@ -8,8 +8,8 @@ Chaque envoi sur `main` compile automatiquement les deux versions. Elles se trou
 dans l'onglet **Releases** du dépôt :
 
 - `SmartCopy-N.apk` : Android 8.0 et plus
-- `SmartCopy-2.0.0-portable.exe` : Windows, sans installation
-- `SmartCopy-2.0.0-installation.exe` : Windows, avec installation
+- `SmartCopy-3.0.0-portable.exe` : Windows, sans installation
+- `SmartCopy-3.0.0-installation.exe` : Windows, avec installation
 
 ## Ce que fait l'application
 
@@ -26,8 +26,13 @@ dans l'onglet **Releases** du dépôt :
 - **Progression détaillée** : pourcentage, octets, vitesse instantanée, moyenne, pic, temps
   restant, temps écoulé, fichiers, bloc actuel, flux actifs, échecs, graphique du débit en
   direct, progression par fichier.
-- Pause, reprise, annulation (le fichier incomplet est supprimé), nouvelle tentative des
-  échecs. Un fichier déjà présent n'est jamais écrasé : la copie est renommée « nom (1) ».
+- **Vérification d'intégrité** (option) : empreinte SHA-256 calculée pendant la copie, puis
+  relecture de la copie et comparaison. Une copie corrompue est signalée en échec et supprimée.
+- **Fichier déjà présent** (au choix) : renommer la copie « nom (1) », remplacer, ignorer, ou
+  « si différent » (les fichiers identiques, comparés par empreinte, sont ignorés ; les autres
+  remplacés). Sur Windows, le remplacement n'a lieu qu'une fois la nouvelle copie terminée et
+  vérifiée : l'original n'est jamais abîmé par une copie ratée.
+- Pause, reprise, annulation (le fichier incomplet est supprimé), nouvelle tentative des échecs.
 - Android : la copie continue écran éteint, avec la progression dans une notification.
 - Windows : glisser-déposer, dates des fichiers conservées.
 

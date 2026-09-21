@@ -60,6 +60,29 @@
       <button id="btnAnalyze" class="btn green full">Analyser</button>
     </section>
 
+    <section class="card wide" id="optionsCard">
+      <div class="card-title">Options</div>
+      <div class="options">
+        <label class="toggle-row">
+          <div>
+            <div class="opt-title">Vérifier chaque copie</div>
+            <div class="muted small">Relit la copie et compare son empreinte SHA-256 avec celle de l'original.</div>
+          </div>
+          <input type="checkbox" id="optVerify" class="switch" />
+        </label>
+        <div>
+          <div class="opt-title">Si le fichier existe déjà</div>
+          <div class="segmented" id="optPolicy">
+            <button data-policy="rename">Renommer</button>
+            <button data-policy="overwrite">Remplacer</button>
+            <button data-policy="skip">Ignorer</button>
+            <button data-policy="sync">Si différent</button>
+          </div>
+          <div id="policyHelp" class="muted small"></div>
+        </div>
+      </div>
+    </section>
+
     <section class="card wide" id="progressCard">
       <div class="progress-head">
         <div class="pct"><span id="pct">0,0</span><small> %</small></div>
@@ -76,6 +99,7 @@
         <div class="stat"><span>Fichiers</span><b id="sFiles">0 / 0</b></div>
         <div class="stat"><span>Bloc actuel</span><b id="sBlock">—</b></div>
         <div class="stat"><span>Flux actifs</span><b id="sActive">0</b></div>
+        <div class="stat"><span>Ignorés</span><b id="sSkipped">0</b></div>
         <div class="stat"><span>Échecs</span><b id="sFailed">0</b></div>
       </div>
       <div class="chart-wrap">

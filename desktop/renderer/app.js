@@ -6,9 +6,18 @@ const api = window.api;
 const STATUS = {
   pending: 'En attente',
   copying: 'Copie',
+  verifying: 'Vérification',
   done: 'Copié',
+  skipped: 'Ignoré (déjà présent)',
   failed: 'Échec',
   cancelled: 'Annulé',
+};
+
+const POLICY_HELP = {
+  rename: 'Garde les deux fichiers : la copie devient « nom (1) ».',
+  overwrite: "Remplace le fichier existant, seulement une fois la nouvelle copie terminée (et vérifiée si l'option est active).",
+  skip: 'Ne copie pas un fichier si un fichier du même nom existe déjà.',
+  sync: 'Ignore les fichiers identiques (contenu comparé par empreinte), remplace les autres.',
 };
 
 const rows = new Map();
@@ -62,8 +71,10 @@ function makeRow(it) {
   const fill = document.createElement('div');
   fill.className = 'fill';
   bar.append(fill);
-  row.append(main, size, status, bar);
-  const rec = { data: it, row, size, status, fill };
+  const hash = document.createElement('div');
+  hash.className = 'item-hash hidden';
+  row.append(main, size, status, bar, hash);
+  const rec = { data: it, row, size, status, fill, hash };
   rows.set(it.id, rec);
   paint(rec);
   return row;
@@ -72,11 +83,22 @@ function makeRow(it) {
 function paint(rec) {
   const it = rec.data;
   rec.row.dataset.status = it.status;
-  const f = it.size > 0 ? Math.min(1, it.copied / it.size) : it.status === 'done' ? 1 : 0;
-  rec.size.textContent = it.status === 'copying' ? `${fmtBytes(it.copied)} / ${fmtBytes(it.size)}` : fmtBytes(it.size);
+  const verifying = it.status === 'verifying';
+  const done = it.copied || 0;
+  let f;
+  if (verifying) f = it.size > 0 ? Math.min(1, (it.verified || 0) / it.size) : 0;
+  else f = it.size > 0 ? Math.min(1, done / it.size) : it.status === 'done' ? 1 : 0;
+  if (it.status === 'copying') rec.size.textContent = `${fmtBytes(done)} / ${fmtBytes(it.size)}`;
+  else if (verifying) rec.size.textContent = `Relecture ${fmtBytes(it.verified || 0)} / ${fmtBytes(it.size)}`;
+  else rec.size.textContent = fmtBytes(it.size);
   let label = STATUS[it.status] || it.status;
   if (it.status === 'copying') label = `${(f * 100).toFixed(0)} %`;
+  if (verifying) label = `Vérif. ${(f * 100).toFixed(0)} %`;
+  if (it.status === 'done' && it.verified > 0) label = 'Copié · vérifié';
   if (it.status === 'failed' && it.error) label = `Échec : ${it.error}`;
+  const showHash = (it.status === 'done' || it.status === 'skipped') && it.hash;
+  show(rec.hash, !!showHash);
+  rec.hash.textContent = showHash ? `SHA-256 ${it.hash}` : '';
   rec.status.textContent = label;
   rec.status.title = label;
   rec.fill.style.width = (f * 100).toFixed(1) + '%';
@@ -235,6 +257,12 @@ function renderSummary(s) {
   $('sBlock').textContent = fmtBytes(s.blockSize);
   $('sActive').textContent = `${s.active} / ${s.workers}`;
   $('sFailed').textContent = String(s.filesFailed);
+  $('sSkipped').textContent = String(s.filesSkipped);
+  $('optVerify').checked = !!s.verify;
+  for (const b of document.querySelectorAll('#optPolicy button')) {
+    b.classList.toggle('active', b.dataset.policy === s.policy);
+  }
+  $('policyHelp').textContent = POLICY_HELP[s.policy] || '';
   $('sFailed').className = s.filesFailed ? 'accent-orange' : '';
 
   const status = $('status');
@@ -245,7 +273,7 @@ function renderSummary(s) {
   } else if (s.running) {
     status.textContent = 'Copie en cours';
     status.classList.add('running');
-  } else if (s.filesTotal > 0 && s.filesDone === s.filesTotal) {
+  } else if (s.filesTotal > 0 && s.filesDone + s.filesSkipped === s.filesTotal) {
     status.textContent = 'Terminé';
     status.classList.add('done');
   } else {
@@ -256,7 +284,7 @@ function renderSummary(s) {
   show($('btnClear'), !s.running);
   show($('btnPause'), s.running);
   show($('btnCancel'), s.running);
-  $('btnStart').disabled = !s.dest || s.filesDone === s.filesTotal || !!s.analyzing;
+  $('btnStart').disabled = !s.dest || s.filesDone + s.filesSkipped === s.filesTotal || !!s.analyzing;
   $('btnClear').disabled = s.filesTotal === 0;
   $('btnPause').textContent = s.paused ? 'Reprendre' : 'Pause';
 
@@ -293,6 +321,10 @@ $('btnPause').addEventListener('click', () => api.togglePause());
 $('btnCancel').addEventListener('click', () => api.cancel());
 $('btnClear').addEventListener('click', () => api.clear());
 $('btnMsgOk').addEventListener('click', () => api.clearMessage());
+$('optVerify').addEventListener('change', (e) => api.setOptions({ verify: e.target.checked }));
+for (const b of document.querySelectorAll('#optPolicy button')) {
+  b.addEventListener('click', () => api.setOptions({ policy: b.dataset.policy }));
+}
 
 let dragDepth = 0;
 document.addEventListener('dragenter', (e) => {

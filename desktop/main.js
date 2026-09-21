@@ -2,10 +2,28 @@
 
 const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
 const path = require('path');
+const fs = require('fs');
 const { CopyEngine } = require('./engine');
 
 let win = null;
 const engine = new CopyEngine();
+
+function settingsFile() {
+  return path.join(app.getPath('userData'), 'settings.json');
+}
+
+function loadSettings() {
+  try {
+    engine.setOptions(JSON.parse(fs.readFileSync(settingsFile(), 'utf8')));
+  } catch {}
+}
+
+function saveSettings() {
+  try {
+    fs.mkdirSync(path.dirname(settingsFile()), { recursive: true });
+    fs.writeFileSync(settingsFile(), JSON.stringify(engine.getOptions(), null, 2));
+  } catch {}
+}
 
 engine.on('state', (state) => {
   if (win && !win.isDestroyed()) win.webContents.send('state', state);
@@ -79,6 +97,10 @@ ipcMain.handle('add-paths', (_e, paths) => {
   return 0;
 });
 
+ipcMain.handle('set-options', (_e, opts) => {
+  engine.setOptions(opts);
+  saveSettings();
+});
 ipcMain.handle('analyze', () => engine.analyze());
 ipcMain.handle('start', () => engine.start());
 ipcMain.handle('toggle-pause', () => engine.togglePause());
@@ -88,6 +110,7 @@ ipcMain.handle('clear-message', () => engine.clearMessage());
 ipcMain.handle('open-dest', () => (engine.dest ? shell.openPath(engine.dest) : null));
 
 app.whenReady().then(() => {
+  loadSettings();
   createWindow();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

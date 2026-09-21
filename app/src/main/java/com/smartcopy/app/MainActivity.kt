@@ -10,6 +10,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -29,6 +30,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
@@ -130,6 +133,7 @@ fun SmartCopyScreen() {
         item { Header() }
         item { DestinationPanel(s) { pickDest.launch(null) } }
         item { AnalysisPanel(s) }
+        item { OptionsPanel(s) }
         item { ProgressPanel(s) }
         item {
             Controls(
@@ -320,6 +324,7 @@ private fun ProgressPanel(s: UiState) {
         Row(Modifier.fillMaxWidth()) {
             Stat("Bloc actuel", formatBytes(s.blockSize.toLong()), TextMain, Modifier.weight(1f))
             Stat("Flux actifs", "${s.activeStreams}", TextMain, Modifier.weight(1f))
+            Stat("Ignorés", "${s.filesSkipped}", TextMain, Modifier.weight(1f))
             Stat("Échecs", "${s.filesFailed}", if (s.filesFailed > 0) Red else TextMain, Modifier.weight(1f))
         }
         SpeedChart(s.history)
@@ -329,14 +334,14 @@ private fun ProgressPanel(s: UiState) {
 private fun statusLabel(s: UiState): String = when {
     s.running && s.paused -> "En pause"
     s.running -> "Copie en cours"
-    s.filesTotal > 0 && s.filesDone == s.filesTotal -> "Terminé"
+    s.filesTotal > 0 && s.filesDone + s.filesSkipped == s.filesTotal -> "Terminé"
     else -> "Prêt"
 }
 
 private fun statusColor(s: UiState): Color = when {
     s.running && s.paused -> Orange
     s.running -> Blue
-    s.filesTotal > 0 && s.filesDone == s.filesTotal -> Green
+    s.filesTotal > 0 && s.filesDone + s.filesSkipped == s.filesTotal -> Green
     else -> Muted
 }
 
@@ -352,7 +357,7 @@ private fun Controls(s: UiState, onAddFiles: () -> Unit, onAddFolder: () -> Unit
                 ActionButton(
                     "Démarrer",
                     Green,
-                    enabled = s.destination != null && s.items.any { it.status != ItemStatus.DONE } && s.analyzing == null,
+                    enabled = s.destination != null && s.items.any { it.status != ItemStatus.DONE && it.status != ItemStatus.SKIPPED } && s.analyzing == null,
                     modifier = Modifier.weight(1f)
                 ) { CopyEngine.start() }
                 ActionButton(
@@ -400,23 +405,28 @@ private fun MessageBar(text: String) {
 
 @Composable
 private fun ItemRow(item: ItemUi) {
-    val frac = when {
+    val copyFrac = when {
         item.size > 0 -> (item.copied.toFloat() / item.size.toFloat()).coerceIn(0f, 1f)
         item.status == ItemStatus.DONE -> 1f
         else -> 0f
     }
+    val verifyFrac = if (item.size > 0) (item.verified.toFloat() / item.size.toFloat()).coerceIn(0f, 1f) else 0f
     val color = when (item.status) {
         ItemStatus.DONE -> Green
         ItemStatus.FAILED -> Red
         ItemStatus.CANCELLED -> Muted
         ItemStatus.COPYING -> Blue
+        ItemStatus.VERIFYING -> Orange
+        ItemStatus.SKIPPED -> Muted
         ItemStatus.PENDING -> Muted
     }
     val label = when (item.status) {
-        ItemStatus.DONE -> "Copié"
+        ItemStatus.DONE -> if (item.verified > 0) "Copié · vérifié" else "Copié"
         ItemStatus.FAILED -> "Échec"
         ItemStatus.CANCELLED -> "Annulé"
-        ItemStatus.COPYING -> String.format(Locale.FRANCE, "%.0f %%", frac * 100f)
+        ItemStatus.COPYING -> String.format(Locale.FRANCE, "%.0f %%", copyFrac * 100f)
+        ItemStatus.VERIFYING -> String.format(Locale.FRANCE, "Vérif. %.0f %%", verifyFrac * 100f)
+        ItemStatus.SKIPPED -> "Ignoré (déjà présent)"
         ItemStatus.PENDING -> "En attente"
     }
     Column(
@@ -437,19 +447,87 @@ private fun ItemRow(item: ItemUi) {
             Spacer(Modifier.width(8.dp))
             Text(label, color = color, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
         }
-        if (item.status == ItemStatus.COPYING || item.status == ItemStatus.DONE) {
-            Bar(frac, color, 6.dp)
+        when (item.status) {
+            ItemStatus.COPYING, ItemStatus.DONE -> Bar(copyFrac, color, 6.dp)
+            ItemStatus.VERIFYING -> Bar(verifyFrac, Orange, 6.dp)
+            else -> {
+            }
         }
         Text(
-            if (item.status == ItemStatus.COPYING) "${formatBytes(item.copied)} / ${formatBytes(item.size)}"
-            else formatBytes(item.size),
+            when (item.status) {
+                ItemStatus.COPYING -> "${formatBytes(item.copied)} / ${formatBytes(item.size)}"
+                ItemStatus.VERIFYING -> "Relecture ${formatBytes(item.verified)} / ${formatBytes(item.size)}"
+                else -> formatBytes(item.size)
+            },
             color = Muted,
             fontSize = 11.sp
         )
+        val hash = item.hash
+        if ((item.status == ItemStatus.DONE || item.status == ItemStatus.SKIPPED) && hash != null) {
+            Text("SHA-256 " + hash.take(16) + "…", color = Muted, fontSize = 10.sp, maxLines = 1)
+        }
         val err = item.error
         if (item.status == ItemStatus.FAILED && err != null) {
             Text(err, color = Red, fontSize = 11.sp)
         }
+    }
+}
+
+@Composable
+private fun OptionsPanel(s: UiState) {
+    Panel("Options") {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text("Vérifier chaque copie", color = TextMain, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                Text(
+                    "Relit la copie et compare son empreinte SHA-256 avec celle de l'original.",
+                    color = Muted,
+                    fontSize = 12.sp
+                )
+            }
+            Spacer(Modifier.width(12.dp))
+            Switch(
+                checked = s.verify,
+                onCheckedChange = { CopyEngine.setVerify(it) },
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor = DarkText,
+                    checkedTrackColor = Green,
+                    uncheckedThumbColor = Muted,
+                    uncheckedTrackColor = Track
+                )
+            )
+        }
+        Spacer(Modifier.height(4.dp))
+        Text("Si le fichier existe déjà", color = TextMain, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            for (p in ConflictPolicy.values()) {
+                Chip(p.label, selected = s.policy == p, modifier = Modifier.weight(1f)) {
+                    CopyEngine.setPolicy(p)
+                }
+            }
+        }
+        Text(s.policy.help, color = Muted, fontSize = 12.sp)
+    }
+}
+
+@Composable
+private fun Chip(label: String, selected: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    Box(
+        modifier
+            .clip(RoundedCornerShape(10.dp))
+            .background(if (selected) Blue else Neutral)
+            .clickable(onClick = onClick)
+            .padding(vertical = 10.dp, horizontal = 4.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            label,
+            color = if (selected) DarkText else TextMain,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
     }
 }
 

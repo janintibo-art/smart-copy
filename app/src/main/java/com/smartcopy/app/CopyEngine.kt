@@ -26,6 +26,7 @@ import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.FileOutputStream
+import java.security.MessageDigest
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -36,7 +37,14 @@ private const val BIG_FILE = 16L * 1024 * 1024
 private const val TUNE_WINDOW = 32L * 1024 * 1024
 private const val HISTORY_SIZE = 120
 
-enum class ItemStatus { PENDING, COPYING, DONE, FAILED, CANCELLED }
+enum class ItemStatus { PENDING, COPYING, VERIFYING, DONE, SKIPPED, FAILED, CANCELLED }
+
+enum class ConflictPolicy(val label: String, val help: String) {
+    RENAME("Renommer", "Garde les deux fichiers : la copie devient « nom (1) »."),
+    OVERWRITE("Remplacer", "Écrase le fichier déjà présent dans la destination."),
+    SKIP("Ignorer", "Ne copie pas un fichier si un fichier du même nom existe déjà."),
+    SYNC("Si différent", "Ignore les fichiers identiques (contenu comparé par empreinte), remplace les autres.")
+}
 
 class CopyItem(
     val id: Long,
@@ -46,6 +54,8 @@ class CopyItem(
     val relDir: List<String>
 ) {
     val copied = AtomicLong(0)
+    val verified = AtomicLong(0)
+    @Volatile var hash: String? = null
     @Volatile var status: ItemStatus = ItemStatus.PENDING
     @Volatile var error: String? = null
     @Volatile var holdsBig: Boolean = false
@@ -58,7 +68,9 @@ data class ItemUi(
     val size: Long,
     val copied: Long,
     val status: ItemStatus,
-    val error: String?
+    val error: String?,
+    val verified: Long,
+    val hash: String?
 )
 
 data class UiState(
@@ -70,6 +82,9 @@ data class UiState(
     val filesTotal: Int = 0,
     val filesDone: Int = 0,
     val filesFailed: Int = 0,
+    val filesSkipped: Int = 0,
+    val verify: Boolean = true,
+    val policy: ConflictPolicy = ConflictPolicy.RENAME,
     val speed: Double = 0.0,
     val avgSpeed: Double = 0.0,
     val peakSpeed: Double = 0.0,
@@ -100,6 +115,8 @@ object CopyEngine {
     private val dirLock = Mutex()
     private val dirCache = HashMap<String, Uri>()
     private val claimLock = Any()
+    private val listingLock = Any()
+    private val listings = HashMap<String, HashMap<String, Pair<Uri, Long>>>()
     private val statLock = Any()
 
     @Volatile private var bigBusy = false
@@ -120,7 +137,30 @@ object CopyEngine {
         get() = runJob?.isActive == true
 
     fun init(context: Context) {
-        if (!::app.isInitialized) app = context.applicationContext
+        if (::app.isInitialized) return
+        app = context.applicationContext
+        val p = prefs()
+        val verify = p.getBoolean("verify", true)
+        val policy = try {
+            ConflictPolicy.valueOf(p.getString("policy", ConflictPolicy.RENAME.name) ?: ConflictPolicy.RENAME.name)
+        } catch (e: Exception) {
+            ConflictPolicy.RENAME
+        }
+        _state.update { it.copy(verify = verify, policy = policy) }
+    }
+
+    private fun prefs() = app.getSharedPreferences("smartcopy", Context.MODE_PRIVATE)
+
+    // ---------- Options ----------
+
+    fun setVerify(value: Boolean) {
+        _state.update { it.copy(verify = value) }
+        prefs().edit().putBoolean("verify", value).apply()
+    }
+
+    fun setPolicy(value: ConflictPolicy) {
+        _state.update { it.copy(policy = value) }
+        prefs().edit().putString("policy", value.name).apply()
     }
 
     // ---------- Destination ----------
@@ -295,6 +335,7 @@ object CopyEngine {
             if (item.status == ItemStatus.FAILED || item.status == ItemStatus.CANCELLED) {
                 item.status = ItemStatus.PENDING
                 item.error = null
+                item.verified.set(0)
             }
         }
         if (items.none { it.status == ItemStatus.PENDING }) {
@@ -303,6 +344,7 @@ object CopyEngine {
         }
         paused.value = false
         liveWorkers.set(0)
+        synchronized(listingLock) { listings.clear() }
         _state.update { it.copy(running = true, paused = false, message = null) }
         try {
             ContextCompat.startForegroundService(app, Intent(app, CopyService::class.java))
@@ -400,16 +442,66 @@ object CopyEngine {
 
     private suspend fun copyOne(item: CopyItem, dest: Uri) {
         val cr = app.contentResolver
+        val dirKey = item.relDir.joinToString("/")
         var target: Uri? = null
+        var createdNew = false
+        var truncated = false
         var ok = false
         active.incrementAndGet()
         try {
             val parent = ensureDir(dest, item.relDir)
-            val mime = cr.getType(item.src) ?: "application/octet-stream"
-            val created = DocumentsContract.createDocument(cr, parent, mime, item.name)
-                ?: throw IllegalStateException("création du fichier refusée")
-            target = created
-            copyStreams(item, created, item.holdsBig)
+            val policy = _state.value.policy
+            val existing = if (policy == ConflictPolicy.RENAME) null else findExisting(dest, parent, dirKey, item.name)
+            var mode = "w"
+            if (existing != null) {
+                when (policy) {
+                    ConflictPolicy.SKIP -> {
+                        item.status = ItemStatus.SKIPPED
+                        ok = true
+                        return
+                    }
+                    ConflictPolicy.SYNC -> {
+                        if (existing.second == item.size) {
+                            item.status = ItemStatus.VERIFYING
+                            val a = hashUri(item.src, null)
+                            val b = hashUri(existing.first, null)
+                            if (a == b) {
+                                item.hash = a
+                                item.status = ItemStatus.SKIPPED
+                                ok = true
+                                return
+                            }
+                            item.status = ItemStatus.COPYING
+                        }
+                        target = existing.first
+                        mode = "wt"
+                    }
+                    ConflictPolicy.OVERWRITE -> {
+                        target = existing.first
+                        mode = "wt"
+                    }
+                    ConflictPolicy.RENAME -> {
+                    }
+                }
+            }
+            val out: Uri = target ?: run {
+                val mime = cr.getType(item.src) ?: "application/octet-stream"
+                val created = DocumentsContract.createDocument(cr, parent, mime, item.name)
+                    ?: throw IllegalStateException("création du fichier refusée")
+                createdNew = true
+                rememberFile(dirKey, item.name, created, item.size)
+                created
+            }
+            target = out
+            val srcHash = copyStreams(item, out, item.holdsBig, mode) { truncated = true }
+            item.hash = srcHash
+            if (_state.value.verify) {
+                item.status = ItemStatus.VERIFYING
+                val dstHash = hashUri(out) { n -> item.verified.addAndGet(n.toLong()) }
+                if (dstHash != srcHash) {
+                    throw IllegalStateException("empreinte différente : la copie est corrompue")
+                }
+            }
             ok = true
             item.status = ItemStatus.DONE
         } catch (e: CancellationException) {
@@ -426,12 +518,14 @@ object CopyEngine {
             }
             if (!ok) {
                 copiedTotal.addAndGet(-item.copied.getAndSet(0))
+                item.verified.set(0)
                 val t = target
-                if (t != null) {
+                if (t != null && (createdNew || truncated)) {
                     try {
                         DocumentsContract.deleteDocument(cr, t)
                     } catch (e: Exception) {
                     }
+                    forgetFile(dirKey, item.name)
                 }
             }
         }
@@ -442,8 +536,15 @@ object CopyEngine {
         var len = 0
     }
 
-    /** Copie en pipeline : la lecture du bloc suivant se fait pendant l'écriture du bloc courant. */
-    private suspend fun copyStreams(item: CopyItem, target: Uri, big: Boolean) {
+    /** Copie en pipeline : la lecture (et le calcul d'empreinte) du bloc suivant se fait
+     *  pendant l'écriture du bloc courant. Renvoie l'empreinte SHA-256 de la source. */
+    private suspend fun copyStreams(
+        item: CopyItem,
+        target: Uri,
+        big: Boolean,
+        mode: String,
+        onOutputOpened: () -> Unit
+    ): String {
         val cr = app.contentResolver
         val capacity = if (big) {
             MAX_BLOCK
@@ -452,13 +553,15 @@ object CopyEngine {
         }
         val input = cr.openInputStream(item.src) ?: throw IllegalStateException("lecture impossible")
         val outPfd = try {
-            cr.openFileDescriptor(target, "w") ?: throw IllegalStateException("écriture impossible")
+            cr.openFileDescriptor(target, mode) ?: throw IllegalStateException("écriture impossible")
         } catch (e: Exception) {
             input.close()
             throw e
         }
+        onOutputOpened()
         val output = FileOutputStream(outPfd.fileDescriptor)
         val tuner = if (big) Tuner(blockSize) else null
+        val md = MessageDigest.getInstance("SHA-256")
         try {
             coroutineScope {
                 val pool = Channel<Chunk>(3)
@@ -478,6 +581,7 @@ object CopyEngine {
                                 n += r
                             }
                             if (n == 0) break
+                            md.update(chunk.buf, 0, n)
                             chunk.len = n
                             filled.send(chunk)
                             if (n < want) break
@@ -511,6 +615,88 @@ object CopyEngine {
             } catch (e: Exception) {
             }
         }
+        return toHex(md.digest())
+    }
+
+    /** Relit un fichier et calcule son empreinte SHA-256 (respecte pause et annulation). */
+    private suspend fun hashUri(uri: Uri, onBytes: ((Int) -> Unit)?): String {
+        val md = MessageDigest.getInstance("SHA-256")
+        val buf = ByteArray(1024 * 1024)
+        val input = app.contentResolver.openInputStream(uri) ?: throw IllegalStateException("relecture impossible")
+        try {
+            while (true) {
+                paused.first { !it }
+                currentCoroutineContext().ensureActive()
+                val r = input.read(buf)
+                if (r < 0) break
+                if (r > 0) {
+                    md.update(buf, 0, r)
+                    onBytes?.invoke(r)
+                }
+            }
+        } finally {
+            try {
+                input.close()
+            } catch (e: Exception) {
+            }
+        }
+        return toHex(md.digest())
+    }
+
+    private fun toHex(bytes: ByteArray): String {
+        val sb = StringBuilder(bytes.size * 2)
+        for (b in bytes) {
+            val v = b.toInt() and 0xff
+            sb.append(HEX[v shr 4])
+            sb.append(HEX[v and 0x0f])
+        }
+        return sb.toString()
+    }
+
+    private const val HEX = "0123456789abcdef"
+
+    // ---------- Fichiers déjà présents dans la destination ----------
+
+    private fun findExisting(tree: Uri, parent: Uri, dirKey: String, name: String): Pair<Uri, Long>? {
+        synchronized(listingLock) {
+            val map = listings.getOrPut(dirKey) { loadListing(tree, parent) }
+            return map[name]
+        }
+    }
+
+    private fun rememberFile(dirKey: String, name: String, uri: Uri, size: Long) {
+        synchronized(listingLock) { listings[dirKey]?.put(name, Pair(uri, size)) }
+    }
+
+    private fun forgetFile(dirKey: String, name: String) {
+        synchronized(listingLock) { listings[dirKey]?.remove(name) }
+    }
+
+    private fun loadListing(tree: Uri, parent: Uri): HashMap<String, Pair<Uri, Long>> {
+        val map = HashMap<String, Pair<Uri, Long>>()
+        try {
+            val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, DocumentsContract.getDocumentId(parent))
+            app.contentResolver.query(
+                children,
+                arrayOf(
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                    DocumentsContract.Document.COLUMN_MIME_TYPE,
+                    DocumentsContract.Document.COLUMN_SIZE
+                ),
+                null, null, null
+            )?.use { c ->
+                while (c.moveToNext()) {
+                    val id = c.getString(0) ?: continue
+                    val name = c.getString(1) ?: continue
+                    if (c.getString(2) == DocumentsContract.Document.MIME_TYPE_DIR) continue
+                    val size = if (c.isNull(3)) 0L else c.getLong(3)
+                    map[name] = Pair(DocumentsContract.buildDocumentUriUsingTree(tree, id), size)
+                }
+            }
+        } catch (e: Exception) {
+        }
+        return map
     }
 
     /** Ajuste la taille de bloc en continu (montée de gradient simple sur le débit mesuré). */
@@ -627,14 +813,24 @@ object CopyEngine {
         var total = 0L
         var done = 0
         var failed = 0
+        var skipped = 0
         for (i in snapshot) {
-            total += i.size
-            if (i.status == ItemStatus.DONE) done++ else if (i.status == ItemStatus.FAILED) failed++
+            when (i.status) {
+                ItemStatus.SKIPPED -> skipped++
+                ItemStatus.DONE -> done++
+                ItemStatus.FAILED -> failed++
+                else -> {
+                }
+            }
+            if (i.status != ItemStatus.SKIPPED) total += i.size
         }
         val copied = copiedTotal.get()
         val running = isRunning
         val ui = snapshot.map {
-            ItemUi(it.id, it.name, it.relDir.joinToString(" / "), it.size, it.copied.get(), it.status, it.error)
+            ItemUi(
+                it.id, it.name, it.relDir.joinToString(" / "), it.size, it.copied.get(), it.status, it.error,
+                it.verified.get(), it.hash
+            )
         }
         synchronized(statLock) {
             val avg = if (elapsedMs > 0) copied / (elapsedMs / 1000.0) else 0.0
@@ -653,6 +849,7 @@ object CopyEngine {
                     filesTotal = snapshot.size,
                     filesDone = done,
                     filesFailed = failed,
+                    filesSkipped = skipped,
                     speed = sm,
                     avgSpeed = avg,
                     peakSpeed = pk,
@@ -672,10 +869,12 @@ object CopyEngine {
         publish()
         val s = _state.value
         val cancelled = items.any { it.status == ItemStatus.CANCELLED }
+        val skippedText = if (s.filesSkipped > 0) ", ${s.filesSkipped} ignorés" else ""
+        val verifiedText = if (s.verify && s.filesDone > 0) " et vérifiés" else ""
         val text = when {
             cancelled -> "Copie annulée. « Démarrer » reprend les fichiers restants."
-            s.filesFailed > 0 -> "Terminé : ${s.filesDone} copiés, ${s.filesFailed} en échec (« Démarrer » pour réessayer)."
-            else -> "Terminé : ${s.filesDone} fichier(s) copiés."
+            s.filesFailed > 0 -> "Terminé : ${s.filesDone} copiés$skippedText, ${s.filesFailed} en échec (« Démarrer » pour réessayer)."
+            else -> "Terminé : ${s.filesDone} fichier(s) copiés$verifiedText$skippedText."
         }
         _state.update {
             it.copy(running = false, paused = false, speed = 0.0, etaMs = -1L, activeStreams = 0, message = text)
