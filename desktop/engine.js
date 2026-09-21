@@ -46,22 +46,6 @@ class Tuner {
   }
 }
 
-async function openUnique(target) {
-  const dir = path.dirname(target);
-  const ext = path.extname(target);
-  const base = path.basename(target, ext);
-  for (let n = 0; n < 10000; n++) {
-    const candidate = n === 0 ? target : path.join(dir, `${base} (${n})${ext}`);
-    try {
-      const fh = await fsp.open(candidate, 'wx');
-      return { fh, file: candidate };
-    } catch (e) {
-      if (e.code !== 'EEXIST') throw e;
-    }
-  }
-  throw new Error('trop de fichiers portant le même nom');
-}
-
 async function writeAll(fh, buf, len) {
   let off = 0;
   while (off < len) {
@@ -72,6 +56,26 @@ async function writeAll(fh, buf, len) {
 
 const POLICIES = ['rename', 'overwrite', 'skip', 'sync'];
 const MODES = ['copy', 'move'];
+
+const partName = (target, id) => `${target}.smartcopy-${id}.part`;
+const HISTORY_MAX = 50;
+
+function readJson(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function writeJsonAtomic(file, data) {
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(data));
+    fs.renameSync(tmp, file);
+  } catch {}
+}
 
 function samePath(a, b) {
   const x = path.resolve(a);
@@ -136,6 +140,7 @@ function itemView(it) {
     error: it.error,
     moved: it.moved,
     instant: it.instant,
+    already: it.already,
     warning: it.warning,
   };
 }
@@ -179,6 +184,150 @@ class CopyEngine extends EventEmitter {
     this.mode = 'copy';
     this.sourceRoots = [];
     this.completing = false;
+
+    this.storeDir = null;
+    this.pastRuns = [];
+    this.savedSession = null;
+    this.run = null;
+    this.ticks = 0;
+  }
+
+  // ---------- Historique et reprise ----------
+
+  setStoreDir(dir) {
+    this.storeDir = dir;
+    const h = readJson(path.join(dir, 'history.json'));
+    this.pastRuns = Array.isArray(h) ? h.slice(0, HISTORY_MAX) : [];
+    const sess = readJson(path.join(dir, 'session.json'));
+    this.savedSession = sess && Array.isArray(sess.items) && sess.items.length && sess.dest ? sess : null;
+    this.emitState();
+  }
+
+  resumeOffer() {
+    const sess = this.savedSession;
+    if (!sess) return null;
+    return {
+      files: sess.items.length,
+      bytes: sess.items.reduce((a, i) => a + (i.size || 0), 0),
+      dest: sess.dest,
+      savedAt: sess.savedAt,
+    };
+  }
+
+  saveSession() {
+    if (!this.storeDir || this.savedSession) return;
+    const file = path.join(this.storeDir, 'session.json');
+    const remaining = this.items.filter((i) => i.status !== 'done' && i.status !== 'skipped');
+    if (!this.dest || !remaining.length) {
+      try {
+        fs.unlinkSync(file);
+      } catch {}
+      return;
+    }
+    writeJsonAtomic(file, {
+      dest: this.dest,
+      mode: this.mode,
+      savedAt: Date.now(),
+      items: remaining.map((i) => ({
+        id: i.id,
+        src: i.src,
+        name: i.name,
+        size: i.size,
+        rel: i.rel,
+        atime: +i.atime,
+        mtime: +i.mtime,
+      })),
+      roots: this.sourceRoots,
+    });
+  }
+
+  async cleanupPartials(sess) {
+    for (const i of sess.items) {
+      await fsp.unlink(partName(path.join(sess.dest, ...(i.rel || []), i.name), i.id)).catch(() => {});
+    }
+  }
+
+  async resumeSession() {
+    const sess = this.savedSession;
+    if (!sess || this.running) return;
+    this.message = 'Reprise du transfert…';
+    for (const i of sess.items) {
+      this.items.push({
+        id: i.id,
+        src: i.src,
+        name: i.name,
+        size: i.size,
+        atime: new Date(i.atime),
+        mtime: new Date(i.mtime),
+        rel: i.rel || [],
+        copied: 0,
+        verified: 0,
+        hash: null,
+        status: 'pending',
+        error: null,
+        holdsBig: false,
+        moved: false,
+        instant: false,
+        warning: null,
+        resumeCheck: true,
+        already: false,
+      });
+    }
+    this.nextId = Math.max(this.nextId, ...sess.items.map((i) => i.id + 1));
+    this.sourceRoots = Array.isArray(sess.roots) ? sess.roots : [];
+    if (MODES.includes(sess.mode)) this.mode = sess.mode;
+    await this.cleanupPartials(sess);
+    this.savedSession = null;
+    this.emitState(true);
+    await this.setDestination(sess.dest);
+    await this.start();
+  }
+
+  async discardSession() {
+    const sess = this.savedSession;
+    if (!sess) return;
+    this.savedSession = null;
+    if (this.storeDir) {
+      try {
+        fs.unlinkSync(path.join(this.storeDir, 'session.json'));
+      } catch {}
+    }
+    this.emitState();
+    await this.cleanupPartials(sess);
+  }
+
+  recordHistory(cancelled, verified) {
+    const r = this.run;
+    if (!r) return;
+    const done = this.items.filter((i) => i.status === 'done' && !r.doneBefore.has(i.id)).length;
+    const skipped = this.items.filter((i) => i.status === 'skipped' && !r.skippedBefore.has(i.id)).length;
+    const failedItems = this.items.filter((i) => i.status === 'failed');
+    if (!done && !skipped && !failedItems.length && !cancelled) return;
+    const bytes = Math.max(0, this.copied - r.startBytes);
+    const durationMs = Math.max(0, this.elapsedMs - r.startElapsed);
+    this.pastRuns.unshift({
+      time: Date.now(),
+      mode: this.mode,
+      done,
+      skipped,
+      failed: failedItems.length,
+      bytes,
+      durationMs,
+      avgSpeed: durationMs > 0 ? bytes / (durationMs / 1000) : 0,
+      peakSpeed: r.peak,
+      dest: this.dest,
+      verified,
+      cancelled,
+      failures: failedItems.slice(0, 30).map((i) => ({ name: i.name, error: i.error || '' })),
+    });
+    this.pastRuns = this.pastRuns.slice(0, HISTORY_MAX);
+    if (this.storeDir) writeJsonAtomic(path.join(this.storeDir, 'history.json'), this.pastRuns);
+  }
+
+  clearHistory() {
+    this.pastRuns = [];
+    if (this.storeDir) writeJsonAtomic(path.join(this.storeDir, 'history.json'), []);
+    this.emitState();
   }
 
   // ---------- Options ----------
@@ -223,7 +372,9 @@ class CopyEngine extends EventEmitter {
       }
     }
     for (const it of found) this.items.push(it);
+    if (this.savedSession) await this.discardSession();
     if (this.running) this.spawnWorkers();
+    this.saveSession();
     this.emitState(true);
     return found.length;
   }
@@ -326,6 +477,14 @@ class CopyEngine extends EventEmitter {
     this.paused = false;
     this.cancelled = false;
     this.message = null;
+    this.run = {
+      startBytes: this.copied,
+      startElapsed: this.elapsedMs,
+      peak: 0,
+      doneBefore: new Set(this.items.filter((i) => i.status === 'done').map((i) => i.id)),
+      skippedBefore: new Set(this.items.filter((i) => i.status === 'skipped').map((i) => i.id)),
+    };
+    this.saveSession();
     this.lastTick = Date.now();
     this.lastBytes = this.copied;
     this.timer = setInterval(() => this.tick(), 250);
@@ -374,6 +533,7 @@ class CopyEngine extends EventEmitter {
     this.history = [];
     this.message = null;
     this.dirty.clear();
+    this.saveSession();
     this.emitState(true);
   }
 
@@ -452,8 +612,24 @@ class CopyEngine extends EventEmitter {
         return;
       }
       const policy = this.policy;
-      const existing = policy === 'rename' && !move ? null : await statOrNull(wanted);
+      const existing = policy === 'rename' && !move && !it.resumeCheck ? null : await statOrNull(wanted);
       const exists = !!(existing && existing.isFile());
+
+      // Reprise : ce fichier a peut-être été terminé juste avant l'interruption.
+      if (it.resumeCheck && exists && existing.size === it.size) {
+        this.setStatus(it, 'verifying');
+        const a = await this.hashFile(it.src, null);
+        const b = await this.hashFile(wanted, null);
+        if (a === b) {
+          it.hash = a;
+          it.already = true;
+          if (move) await this.deleteSource(it);
+          it.status = 'done';
+          ok = true;
+          return;
+        }
+        this.setStatus(it, 'copying');
+      }
 
       if (exists && policy === 'skip') {
         it.status = 'skipped';
@@ -489,12 +665,9 @@ class CopyEngine extends EventEmitter {
         }
       }
 
-      if (exists && policy !== 'rename') {
-        const tmp = `${wanted}.smartcopy-part`;
-        out = { fh: await fsp.open(tmp, 'w'), file: tmp, finalName: wanted };
-      } else {
-        out = await openUnique(wanted);
-      }
+      // Écriture sous un nom temporaire : un fichier incomplet ne porte jamais le vrai nom.
+      const tmp = partName(wanted, it.id);
+      out = { fh: await fsp.open(tmp, 'w'), file: tmp };
 
       let srcHash;
       try {
@@ -513,10 +686,11 @@ class CopyEngine extends EventEmitter {
         });
         if (dstHash !== srcHash) throw new Error('empreinte différente : la copie est corrompue');
       }
-      if (out.finalName) {
-        await fsp.rename(out.file, out.finalName);
-        out.file = out.finalName;
-      }
+      // Mise en place sous le vrai nom, seulement maintenant que la copie est complète (et vérifiée).
+      const current = await statOrNull(wanted);
+      const finalName = current && (policy === 'rename' || !current.isFile()) ? await freeName(wanted) : wanted;
+      await fsp.rename(out.file, finalName);
+      out.file = finalName;
       await fsp.utimes(out.file, it.atime, it.mtime).catch(() => {});
       ok = true;
       it.status = 'done';
@@ -646,6 +820,9 @@ class CopyEngine extends EventEmitter {
     if (this.paused) this.smoothed = 0;
     else this.smoothed = this.smoothed === 0 ? inst : this.smoothed * 0.7 + inst * 0.3;
     if (this.smoothed > this.peak) this.peak = this.smoothed;
+    if (this.run && this.smoothed > this.run.peak) this.run.peak = this.smoothed;
+    this.ticks++;
+    if (this.ticks % 8 === 0) this.saveSession();
     this.half = !this.half;
     if (this.half) {
       this.history.push(this.smoothed);
@@ -669,7 +846,10 @@ class CopyEngine extends EventEmitter {
     if (this.cancelled) this.message = 'Transfert annulé. « Démarrer » reprend les fichiers restants.';
     else if (s.filesFailed) this.message = `Terminé : ${s.filesDone} ${verb}${skippedText}, ${s.filesFailed} en échec (« Démarrer » pour réessayer).${warnText}`;
     else this.message = `Terminé : ${s.filesDone} fichier(s) ${verb}${verifiedText}${skippedText}.${warnText}`;
+    this.recordHistory(this.cancelled, anyVerified);
+    this.run = null;
     this.cancelled = false;
+    this.saveSession();
     this.emitState();
   }
 
@@ -685,7 +865,7 @@ class CopyEngine extends EventEmitter {
         skipped++;
         continue;
       }
-      if (!it.instant) total += it.size;
+      if (!it.instant && !it.already) total += it.size;
       if (it.status === 'done') done++;
       else if (it.status === 'failed') failed++;
     }
@@ -719,6 +899,8 @@ class CopyEngine extends EventEmitter {
       analysis: this.analysis,
       analyzing: this.analyzing,
       message: this.message,
+      pastRuns: this.pastRuns,
+      resumeOffer: this.running ? null : this.resumeOffer(),
     };
   }
 

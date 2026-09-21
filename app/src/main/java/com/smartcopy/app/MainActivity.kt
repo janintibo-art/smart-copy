@@ -59,6 +59,8 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 
 private val Bg = Color(0xFF0B0F17)
@@ -118,6 +120,8 @@ fun SmartCopyScreen() {
     }
     val notifPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
     var confirmMove by remember { mutableStateOf(false) }
+    var showHistory by remember { mutableStateOf(false) }
+    var openedRun by remember { mutableStateOf(-1L) }
 
     if (confirmMove) {
         val pending = s.items.count { it.status != ItemStatus.DONE && it.status != ItemStatus.SKIPPED }
@@ -161,6 +165,10 @@ fun SmartCopyScreen() {
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         item { Header() }
+        val offer = s.resumeOffer
+        if (offer != null && !s.running) {
+            item { ResumePanel(offer) }
+        }
         item { DestinationPanel(s) { pickDest.launch(null) } }
         item { AnalysisPanel(s) }
         item { OptionsPanel(s) }
@@ -202,6 +210,121 @@ fun SmartCopyScreen() {
             }
         }
         items(s.items, key = { it.id }) { item -> ItemRow(item) }
+        item {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(top = 8.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(CardBg)
+                    .clickable { showHistory = !showHistory }
+                    .padding(14.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    "Historique (${s.pastRuns.size})",
+                    color = TextMain,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f)
+                )
+                Text(if (showHistory) "Masquer" else "Afficher", color = Blue, fontSize = 13.sp)
+            }
+        }
+        if (showHistory) {
+            if (s.pastRuns.isEmpty()) {
+                item { Text("Aucun transfert enregistré pour l'instant.", color = Muted, fontSize = 13.sp) }
+            } else {
+                items(s.pastRuns, key = { "h" + it.time }) { run ->
+                    HistoryRow(run, expanded = openedRun == run.time) {
+                        openedRun = if (openedRun == run.time) -1L else run.time
+                    }
+                }
+                item {
+                    ActionButton("Effacer l'historique", Neutral, contentColor = TextMain, modifier = Modifier.fillMaxWidth()) {
+                        CopyEngine.clearHistory()
+                    }
+                }
+            }
+        }
+    }
+}
+
+private val dateFormat = SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.FRANCE)
+
+@Composable
+private fun ResumePanel(offer: ResumeOffer) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(Color(0xFF3A2A12))
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Text("Transfert inachevé", color = Orange, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+        Text(
+            "${offer.files} fichier(s) restant(s), ${formatBytes(offer.bytes)}, vers ${offer.destinationName}. " +
+                "Dernier état enregistré le ${dateFormat.format(Date(offer.savedAt))}.",
+            color = TextMain,
+            fontSize = 13.sp
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            ActionButton("Reprendre", Green, modifier = Modifier.weight(1f)) { CopyEngine.resumeSession() }
+            ActionButton("Abandonner", Neutral, contentColor = TextMain, modifier = Modifier.weight(1f)) {
+                CopyEngine.discardSession()
+            }
+        }
+    }
+}
+
+@Composable
+private fun HistoryRow(run: HistoryEntry, expanded: Boolean, onToggle: () -> Unit) {
+    val (label, color) = when {
+        run.cancelled -> Pair("Annulé", Muted)
+        run.failed > 0 -> Pair("${run.failed} échec(s)", Red)
+        else -> Pair("Réussi", Green)
+    }
+    val verb = if (run.mode == TransferMode.MOVE) "Déplacement" else "Copie"
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(CardBg)
+            .clickable(onClick = onToggle)
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "$verb · ${dateFormat.format(Date(run.time))}",
+                color = TextMain,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium,
+                modifier = Modifier.weight(1f)
+            )
+            Text(label, color = color, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+        }
+        val skipped = if (run.skipped > 0) " · ${run.skipped} ignoré(s)" else ""
+        Text(
+            "${run.done} fichier(s) · ${formatBytes(run.bytes)}$skipped" + if (run.verified) " · vérifiés" else "",
+            color = Muted,
+            fontSize = 12.sp
+        )
+        Text(
+            "Durée ${formatDuration(run.durationMs)} · moyenne ${formatSpeed(run.avgSpeed)} · pic ${formatSpeed(run.peakSpeed)}",
+            color = Muted,
+            fontSize = 12.sp
+        )
+        if (run.destination.isNotEmpty()) {
+            Text("→ ${run.destination}", color = Muted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        if (expanded && run.failures.isNotEmpty()) {
+            Spacer(Modifier.height(4.dp))
+            for (f in run.failures) {
+                Text("• ${f.first} : ${f.second}", color = Red, fontSize = 11.sp)
+            }
+        }
     }
 }
 
@@ -460,6 +583,7 @@ private fun ItemRow(item: ItemUi) {
     }
     val label = when (item.status) {
         ItemStatus.DONE -> when {
+            item.already -> "Déjà copié avant l'interruption"
             item.instant -> "Déplacé (instantané)"
             item.moved && item.verified > 0 -> "Déplacé · vérifié"
             item.moved -> "Déplacé"

@@ -193,6 +193,20 @@ html, body {
 .item[data-status="verifying"] .fill { background: linear-gradient(90deg, rgba(255, 181, 71, 0.6), var(--orange)); }
 .item[data-status="skipped"] .item-status { color: var(--muted); }
 
+.resume { background: #3a2a12; }
+.resume-title { color: var(--orange); font-weight: 600; font-size: 16px; }
+.small-btn { padding: 6px 12px; font-size: 12px; }
+.history { display: flex; flex-direction: column; gap: 6px; max-height: 360px; overflow-y: auto; padding-right: 4px; }
+.run { background: var(--card2); border-radius: 10px; padding: 10px 12px; cursor: pointer; display: flex; flex-direction: column; gap: 3px; }
+.run-head { display: flex; justify-content: space-between; gap: 12px; }
+.run-title { font-weight: 500; }
+.run-status { font-size: 12px; font-weight: 600; }
+.run-status.ok { color: var(--green); }
+.run-status.ko { color: var(--red); }
+.run-status.cancel { color: var(--muted); }
+.run-line { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run-fail { color: var(--red); font-size: 11px; }
+
 .drop {
   position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
   background: rgba(11, 15, 23, 0.85); border: 3px dashed var(--green);

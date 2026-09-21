@@ -8,8 +8,8 @@ Chaque envoi sur `main` compile automatiquement les deux versions. Elles se trou
 dans l'onglet **Releases** du dépôt :
 
 - `SmartCopy-N.apk` : Android 8.0 et plus
-- `SmartCopy-4.0.0-portable.exe` : Windows, sans installation
-- `SmartCopy-4.0.0-installation.exe` : Windows, avec installation
+- `SmartCopy-5.0.0-portable.exe` : Windows, sans installation
+- `SmartCopy-5.0.0-installation.exe` : Windows, avec installation
 
 ## Ce que fait l'application
 
@@ -37,6 +37,15 @@ dans l'onglet **Releases** du dépôt :
   instantané (simple changement de dossier, aucune donnée recopiée). Les dossiers vidés à la
   source sont supprimés et la structure est recréée à la destination, dossiers vides compris.
   Confirmation avant de lancer, refus de déplacer un dossier dans lui-même.
+- **Écriture sûre** : chaque fichier est d'abord écrit sous un nom temporaire
+  (`nom.smartcopy-N.part`) puis renommé une fois complet et vérifié. Un fichier incomplet ne
+  porte jamais le vrai nom, et « Remplacer » ne détruit jamais l'original si la copie échoue.
+- **Reprise après interruption** (appli fermée, plantage, téléphone éteint, câble débranché) :
+  la file est sauvegardée en continu ; au lancement suivant, un bandeau propose de reprendre.
+  Les restes des fichiers interrompus sont supprimés, et les fichiers déjà terminés sont
+  reconnus par empreinte (pas de doublon).
+- **Historique** des 50 derniers transferts : date, mode, fichiers, volume, durée, débit moyen
+  et pic, destination, et liste des échecs.
 - Pause, reprise, annulation (le fichier incomplet est supprimé), nouvelle tentative des échecs.
 - Android : la copie continue écran éteint, avec la progression dans une notification.
 - Windows : glisser-déposer, dates des fichiers conservées.

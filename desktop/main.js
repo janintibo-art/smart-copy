@@ -16,6 +16,7 @@ function loadSettings() {
   try {
     engine.setOptions(JSON.parse(fs.readFileSync(settingsFile(), 'utf8')));
   } catch {}
+  engine.setStoreDir(app.getPath('userData'));
 }
 
 function saveSettings() {
@@ -102,6 +103,9 @@ ipcMain.handle('set-options', (_e, opts) => {
   saveSettings();
 });
 ipcMain.handle('analyze', () => engine.analyze());
+ipcMain.handle('resume-session', () => engine.resumeSession());
+ipcMain.handle('discard-session', () => engine.discardSession());
+ipcMain.handle('clear-history', () => engine.clearHistory());
 ipcMain.handle('start', () => engine.start());
 ipcMain.handle('toggle-pause', () => engine.togglePause());
 ipcMain.handle('cancel', () => engine.cancel());

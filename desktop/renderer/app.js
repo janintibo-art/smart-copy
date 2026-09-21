@@ -102,7 +102,8 @@ function paint(rec) {
   if (it.status === 'copying') label = `${(f * 100).toFixed(0)} %`;
   if (verifying) label = `Vérif. ${(f * 100).toFixed(0)} %`;
   if (it.status === 'done') {
-    if (it.instant) label = 'Déplacé (instantané)';
+    if (it.already) label = "Déjà copié avant l'interruption";
+    else if (it.instant) label = 'Déplacé (instantané)';
     else if (it.moved) label = it.verified > 0 ? 'Déplacé · vérifié' : 'Déplacé';
     else if (it.verified > 0) label = 'Copié · vérifié';
     f = 1;
@@ -209,6 +210,77 @@ function renderBlockChart(results, best) {
     val.textContent = fmtMBps(r.mbPerSec);
     row.append(label, bar, val);
     box.append(row);
+  }
+}
+
+// ---------- Historique ----------
+
+const openedRuns = new Set();
+let historyKey = '';
+
+function fmtDate(ms) {
+  const d = new Date(ms);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getDate())}/${p(d.getMonth() + 1)}/${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function renderHistory(runs) {
+  const key = runs.map((r) => r.time).join(',') + '|' + [...openedRuns].join(',');
+  if (key === historyKey) return;
+  historyKey = key;
+  $('historyCount').textContent = runs.length ? `(${runs.length})` : '';
+  show($('historyEmpty'), runs.length === 0);
+  $('btnClearHistory').disabled = runs.length === 0;
+  const box = $('history');
+  box.textContent = '';
+  for (const r of runs) {
+    const el = document.createElement('div');
+    el.className = 'run';
+    const head = document.createElement('div');
+    head.className = 'run-head';
+    const title = document.createElement('div');
+    title.className = 'run-title';
+    title.textContent = `${r.mode === 'move' ? 'Déplacement' : 'Copie'} · ${fmtDate(r.time)}`;
+    const status = document.createElement('div');
+    if (r.cancelled) {
+      status.className = 'run-status cancel';
+      status.textContent = 'Annulé';
+    } else if (r.failed) {
+      status.className = 'run-status ko';
+      status.textContent = `${r.failed} échec(s)`;
+    } else {
+      status.className = 'run-status ok';
+      status.textContent = 'Réussi';
+    }
+    head.append(title, status);
+    const l1 = document.createElement('div');
+    l1.className = 'run-line';
+    l1.textContent =
+      `${r.done} fichier(s) · ${fmtBytes(r.bytes)}` +
+      (r.skipped ? ` · ${r.skipped} ignoré(s)` : '') +
+      (r.verified ? ' · vérifiés' : '');
+    const l2 = document.createElement('div');
+    l2.className = 'run-line';
+    l2.textContent = `Durée ${fmtDur(r.durationMs)} · moyenne ${fmtSpeed(r.avgSpeed)} · pic ${fmtSpeed(r.peakSpeed)}`;
+    const l3 = document.createElement('div');
+    l3.className = 'run-line';
+    l3.textContent = r.dest ? `→ ${r.dest}` : '';
+    el.append(head, l1, l2, l3);
+    if (openedRuns.has(r.time)) {
+      for (const f of r.failures || []) {
+        const x = document.createElement('div');
+        x.className = 'run-fail';
+        x.textContent = `• ${f.name} : ${f.error}`;
+        el.append(x);
+      }
+    }
+    el.addEventListener('click', () => {
+      if (openedRuns.has(r.time)) openedRuns.delete(r.time);
+      else openedRuns.add(r.time);
+      historyKey = '';
+      renderHistory(runs);
+    });
+    box.append(el);
   }
 }
 
@@ -323,6 +395,15 @@ function renderSummary(s) {
 
   history = s.history || [];
   drawChart();
+
+  const offer = s.resumeOffer;
+  show($('resumeCard'), !!offer);
+  if (offer) {
+    $('resumeText').textContent =
+      `${offer.files} fichier(s) restant(s), ${fmtBytes(offer.bytes)}, vers ${offer.dest}. ` +
+      `Dernier état enregistré le ${fmtDate(offer.savedAt)}.`;
+  }
+  renderHistory(s.pastRuns || []);
 }
 
 // ---------- Événements ----------
@@ -360,6 +441,11 @@ $('btnPause').addEventListener('click', () => api.togglePause());
 $('btnCancel').addEventListener('click', () => api.cancel());
 $('btnClear').addEventListener('click', () => api.clear());
 $('btnMsgOk').addEventListener('click', () => api.clearMessage());
+$('btnResume').addEventListener('click', () => api.resumeSession());
+$('btnDiscard').addEventListener('click', () => api.discardSession());
+$('btnClearHistory').addEventListener('click', () => {
+  if (window.confirm("Effacer tout l'historique ?")) api.clearHistory();
+});
 $('optVerify').addEventListener('change', (e) => api.setOptions({ verify: e.target.checked }));
 for (const b of document.querySelectorAll('#optPolicy button')) {
   b.addEventListener('click', () => api.setOptions({ policy: b.dataset.policy }));

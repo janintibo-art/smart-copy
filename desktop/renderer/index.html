@@ -19,6 +19,15 @@
   </header>
 
   <main class="grid">
+    <section class="card wide resume hidden" id="resumeCard">
+      <div class="resume-title">Transfert inachevé</div>
+      <div id="resumeText"></div>
+      <div class="controls">
+        <button id="btnResume" class="btn green">Reprendre</button>
+        <button id="btnDiscard" class="btn neutral">Abandonner</button>
+      </div>
+    </section>
+
     <section class="card" id="destCard">
       <div class="card-title">Destination</div>
       <div class="row">
@@ -131,6 +140,14 @@
       <div class="card-title">File d'attente <span id="queueCount"></span></div>
       <div id="queueHint" class="muted small">Glissez-déposez des fichiers ou des dossiers n'importe où dans la fenêtre. Vous pouvez en ajouter pendant la copie : ils passent à la suite.</div>
       <div id="queue" class="queue"></div>
+    </section>
+    <section class="card wide">
+      <div class="row">
+        <div class="card-title grow">Historique <span id="historyCount"></span></div>
+        <button id="btnClearHistory" class="btn neutral small-btn">Effacer</button>
+      </div>
+      <div id="historyEmpty" class="muted small">Aucun transfert enregistré pour l'instant.</div>
+      <div id="history" class="history"></div>
     </section>
   </main>
 

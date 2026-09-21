@@ -65,6 +65,8 @@ class CopyItem(
     @Volatile var moved: Boolean = false
     @Volatile var instant: Boolean = false
     @Volatile var warning: String? = null
+    @Volatile var resumeCheck: Boolean = false
+    @Volatile var already: Boolean = false
     val copied = AtomicLong(0)
     val verified = AtomicLong(0)
     @Volatile var hash: String? = null
@@ -85,7 +87,8 @@ data class ItemUi(
     val hash: String?,
     val moved: Boolean,
     val instant: Boolean,
-    val warning: String?
+    val warning: String?,
+    val already: Boolean
 )
 
 data class UiState(
@@ -115,7 +118,9 @@ data class UiState(
     val destinationInfo: VolumeInfo? = null,
     val analysis: AnalysisResult? = null,
     val analyzing: String? = null,
-    val message: String? = null
+    val message: String? = null,
+    val pastRuns: List<HistoryEntry> = emptyList(),
+    val resumeOffer: ResumeOffer? = null
 )
 
 object CopyEngine {
@@ -137,6 +142,16 @@ object CopyEngine {
 
     private data class FolderRec(val tree: Uri, val docId: String, val rel: List<String>)
     private val sourceFolders = CopyOnWriteArrayList<FolderRec>()
+
+    private val sessionLock = Any()
+    @Volatile private var savedSession: Session? = null
+
+    // Mesures du transfert en cours, pour l'historique
+    private var runStartBytes = 0L
+    private var runStartElapsed = 0L
+    private var runPeak = 0.0
+    private var runDoneBefore: Set<Long> = emptySet()
+    private var runSkippedBefore: Set<Long> = emptySet()
     private val statLock = Any()
 
     @Volatile private var bigBusy = false
@@ -171,7 +186,15 @@ object CopyEngine {
         } catch (e: Exception) {
             TransferMode.COPY
         }
-        _state.update { it.copy(verify = verify, policy = policy, mode = mode) }
+        val past = Persistence.loadHistory(app)
+        val sess = Persistence.loadSession(app)
+        savedSession = sess
+        val offer = if (sess == null) {
+            null
+        } else {
+            ResumeOffer(sess.items.size, sess.items.sumOf { it.size }, treeName(sess.destination), sess.savedAt)
+        }
+        _state.update { it.copy(verify = verify, policy = policy, mode = mode, pastRuns = past, resumeOffer = offer) }
     }
 
     private fun prefs() = app.getSharedPreferences("smartcopy", Context.MODE_PRIVATE)
@@ -233,7 +256,23 @@ object CopyEngine {
 
     // ---------- Ajout de fichiers (possible pendant la copie) ----------
 
+    private fun persistPermission(uri: Uri) {
+        val cr = app.contentResolver
+        try {
+            cr.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            )
+        } catch (e: Exception) {
+            try {
+                cr.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            } catch (e2: Exception) {
+            }
+        }
+    }
+
     fun addFiles(uris: List<Uri>) {
+        for (u in uris) persistPermission(u)
         scope.launch {
             val found = uris.map { queryItem(it) }
             items.addAll(found)
@@ -242,10 +281,7 @@ object CopyEngine {
     }
 
     fun addFolder(tree: Uri) {
-        try {
-            app.contentResolver.takePersistableUriPermission(tree, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        } catch (e: Exception) {
-        }
+        persistPermission(tree)
         scope.launch {
             try {
                 val rootId = DocumentsContract.getTreeDocumentId(tree)
@@ -316,7 +352,9 @@ object CopyEngine {
     }
 
     private fun onItemsAdded() {
+        if (savedSession != null) discardSession()
         publish()
+        saveSession()
         if (isRunning) {
             _state.value.destination?.let { spawnWorkers(it) }
         }
@@ -393,6 +431,14 @@ object CopyEngine {
         paused.value = false
         liveWorkers.set(0)
         synchronized(listingLock) { listings.clear() }
+        synchronized(statLock) {
+            runStartBytes = copiedTotal.get()
+            runStartElapsed = elapsedMs
+            runPeak = 0.0
+        }
+        runDoneBefore = items.filter { it.status == ItemStatus.DONE }.map { it.id }.toSet()
+        runSkippedBefore = items.filter { it.status == ItemStatus.SKIPPED }.map { it.id }.toSet()
+        saveSession()
         _state.update { it.copy(running = true, paused = false, message = null) }
         try {
             ContextCompat.startForegroundService(app, Intent(app, CopyService::class.java))
@@ -430,6 +476,7 @@ object CopyEngine {
         items.clear()
         sourceFolders.clear()
         copiedTotal.set(0)
+        saveSession()
         synchronized(statLock) {
             elapsedMs = 0L
             peak = 0.0
@@ -490,21 +537,38 @@ object CopyEngine {
         return null
     }
 
+    private fun tmpNameOf(item: CopyItem) = "${item.name}.smartcopy-${item.id}.part"
+
     private suspend fun copyOne(item: CopyItem, dest: Uri) {
         val cr = app.contentResolver
         val dirKey = item.relDir.joinToString("/")
         val settings = _state.value
         val move = settings.mode == TransferMode.MOVE
         val verify = settings.verify || move
-        var target: Uri? = null
-        var createdNew = false
-        var truncated = false
+        var tmp: Uri? = null
+        var keepTmp = false
         var ok = false
         active.incrementAndGet()
         try {
             val parent = ensureDir(dest, item.relDir)
             val policy = settings.policy
-            val existing = if (policy == ConflictPolicy.RENAME && !move) null else findExisting(dest, parent, dirKey, item.name)
+            val existing = findExisting(dest, parent, dirKey, item.name)
+
+            // Reprise : ce fichier a peut-être été terminé juste avant l'interruption.
+            if (item.resumeCheck && existing != null && existing.second == item.size) {
+                item.status = ItemStatus.VERIFYING
+                val a = hashUri(item.src, null)
+                val b = hashUri(existing.first, null)
+                if (a == b) {
+                    item.hash = a
+                    item.already = true
+                    if (move) deleteSource(item)
+                    item.status = ItemStatus.DONE
+                    ok = true
+                    return
+                }
+                item.status = ItemStatus.COPYING
+            }
 
             // Déplacement instantané quand le fournisseur le permet (même support) : aucune donnée recopiée.
             val srcParent = item.srcParent
@@ -524,57 +588,63 @@ object CopyEngine {
                 }
             }
 
-            var mode = "w"
             if (existing != null) {
-                when (policy) {
-                    ConflictPolicy.SKIP -> {
+                if (policy == ConflictPolicy.SKIP) {
+                    item.status = ItemStatus.SKIPPED
+                    ok = true
+                    return
+                }
+                if (policy == ConflictPolicy.SYNC && existing.second == item.size) {
+                    item.status = ItemStatus.VERIFYING
+                    val a = hashUri(item.src, null)
+                    val b = hashUri(existing.first, null)
+                    if (a == b) {
+                        item.hash = a
+                        if (move) deleteSource(item)
                         item.status = ItemStatus.SKIPPED
                         ok = true
                         return
                     }
-                    ConflictPolicy.SYNC -> {
-                        if (existing.second == item.size) {
-                            item.status = ItemStatus.VERIFYING
-                            val a = hashUri(item.src, null)
-                            val b = hashUri(existing.first, null)
-                            if (a == b) {
-                                item.hash = a
-                                if (move) deleteSource(item)
-                                item.status = ItemStatus.SKIPPED
-                                ok = true
-                                return
-                            }
-                            item.status = ItemStatus.COPYING
-                        }
-                        target = existing.first
-                        mode = "wt"
-                    }
-                    ConflictPolicy.OVERWRITE -> {
-                        target = existing.first
-                        mode = "wt"
-                    }
-                    ConflictPolicy.RENAME -> {
-                    }
+                    item.status = ItemStatus.COPYING
                 }
             }
-            val out: Uri = target ?: run {
-                val mime = cr.getType(item.src) ?: "application/octet-stream"
-                val created = DocumentsContract.createDocument(cr, parent, mime, item.name)
-                    ?: throw IllegalStateException("création du fichier refusée")
-                createdNew = true
-                rememberFile(dirKey, item.name, created, item.size)
-                created
-            }
-            target = out
-            val srcHash = copyStreams(item, out, item.holdsBig, mode) { truncated = true }
+
+            // Écriture sous un nom temporaire : un fichier incomplet ne porte jamais le vrai nom.
+            val tmpName = tmpNameOf(item)
+            val created = DocumentsContract.createDocument(cr, parent, "application/octet-stream", tmpName)
+                ?: throw IllegalStateException("création du fichier refusée")
+            tmp = created
+            val srcHash = copyStreams(item, created, item.holdsBig)
             item.hash = srcHash
             if (verify) {
                 item.status = ItemStatus.VERIFYING
-                val dstHash = hashUri(out) { n -> item.verified.addAndGet(n.toLong()) }
+                val dstHash = hashUri(created) { n -> item.verified.addAndGet(n.toLong()) }
                 if (dstHash != srcHash) {
                     throw IllegalStateException("empreinte différente : la copie est corrompue")
                 }
             }
+
+            // Mise en place sous le vrai nom, seulement maintenant que la copie est complète (et vérifiée).
+            if (existing != null && policy != ConflictPolicy.RENAME) {
+                val removed = try {
+                    DocumentsContract.deleteDocument(cr, existing.first)
+                } catch (e: Exception) {
+                    false
+                }
+                if (!removed) throw IllegalStateException("impossible de remplacer le fichier existant")
+                forgetFile(dirKey, item.name)
+            }
+            val finalUri = try {
+                DocumentsContract.renameDocument(cr, created, item.name)
+            } catch (e: Exception) {
+                null
+            }
+            if (finalUri == null) {
+                keepTmp = true
+                throw IllegalStateException("copie complète conservée sous le nom « $tmpName » (renommage refusé)")
+            }
+            tmp = null
+            rememberFile(dirKey, item.name, finalUri, item.size)
             ok = true
             item.status = ItemStatus.DONE
             if (move) deleteSource(item)
@@ -593,13 +663,12 @@ object CopyEngine {
             if (!ok) {
                 copiedTotal.addAndGet(-item.copied.getAndSet(0))
                 item.verified.set(0)
-                val t = target
-                if (t != null && (createdNew || truncated)) {
+                val t = tmp
+                if (t != null && !keepTmp) {
                     try {
                         DocumentsContract.deleteDocument(cr, t)
                     } catch (e: Exception) {
                     }
-                    forgetFile(dirKey, item.name)
                 }
             }
         }
@@ -645,13 +714,7 @@ object CopyEngine {
 
     /** Copie en pipeline : la lecture (et le calcul d'empreinte) du bloc suivant se fait
      *  pendant l'écriture du bloc courant. Renvoie l'empreinte SHA-256 de la source. */
-    private suspend fun copyStreams(
-        item: CopyItem,
-        target: Uri,
-        big: Boolean,
-        mode: String,
-        onOutputOpened: () -> Unit
-    ): String {
+    private suspend fun copyStreams(item: CopyItem, target: Uri, big: Boolean): String {
         val cr = app.contentResolver
         val capacity = if (big) {
             MAX_BLOCK
@@ -660,12 +723,11 @@ object CopyEngine {
         }
         val input = cr.openInputStream(item.src) ?: throw IllegalStateException("lecture impossible")
         val outPfd = try {
-            cr.openFileDescriptor(target, mode) ?: throw IllegalStateException("écriture impossible")
+            cr.openFileDescriptor(target, "w") ?: throw IllegalStateException("écriture impossible")
         } catch (e: Exception) {
             input.close()
             throw e
         }
-        onOutputOpened()
         val output = FileOutputStream(outPfd.fileDescriptor)
         val tuner = if (big) Tuner(blockSize) else null
         val md = MessageDigest.getInstance("SHA-256")
@@ -888,6 +950,7 @@ object CopyEngine {
         var lastBytes = copiedTotal.get()
         var lastNs = System.nanoTime()
         var half = false
+        var ticks = 0
         while (currentCoroutineContext().isActive) {
             delay(250)
             val now = System.nanoTime()
@@ -905,6 +968,7 @@ object CopyEngine {
                     else -> smoothed * 0.7 + inst * 0.3
                 }
                 if (smoothed > peak) peak = smoothed
+                if (smoothed > runPeak) runPeak = smoothed
                 half = !half
                 if (half) {
                     history.addLast(smoothed.toFloat())
@@ -912,6 +976,8 @@ object CopyEngine {
                 }
             }
             publish()
+            ticks++
+            if (ticks % 8 == 0) saveSession()
         }
     }
 
@@ -931,14 +997,14 @@ object CopyEngine {
                 else -> {
                 }
             }
-            if (i.status != ItemStatus.SKIPPED && !i.instant) total += i.size
+            if (i.status != ItemStatus.SKIPPED && !i.instant && !i.already) total += i.size
         }
         val copied = copiedTotal.get()
         val running = isRunning
         val ui = snapshot.map {
             ItemUi(
                 it.id, it.name, it.relDir.joinToString(" / "), it.size, it.copied.get(), it.status, it.error,
-                it.verified.get(), it.hash, it.moved, it.instant, it.warning
+                it.verified.get(), it.hash, it.moved, it.instant, it.warning, it.already
             )
         }
         synchronized(statLock) {
@@ -990,8 +1056,134 @@ object CopyEngine {
             s.filesFailed > 0 -> "Terminé : ${s.filesDone} $verb$skippedText, ${s.filesFailed} en échec (« Démarrer » pour réessayer).$warnText"
             else -> "Terminé : ${s.filesDone} fichier(s) $verb$verifiedText$skippedText.$warnText"
         }
+        recordHistory(cancelled, anyVerified)
         _state.update {
             it.copy(running = false, paused = false, speed = 0.0, etaMs = -1L, activeStreams = 0, message = text)
         }
+        saveSession()
+    }
+
+    // ---------- Historique ----------
+
+    private fun recordHistory(cancelled: Boolean, verified: Boolean) {
+        val done = items.count { it.status == ItemStatus.DONE && it.id !in runDoneBefore }
+        val skipped = items.count { it.status == ItemStatus.SKIPPED && it.id !in runSkippedBefore }
+        val failedItems = items.filter { it.status == ItemStatus.FAILED }
+        if (done + skipped + failedItems.size == 0 && !cancelled) return
+        val measures = synchronized(statLock) {
+            Triple(
+                (copiedTotal.get() - runStartBytes).coerceAtLeast(0L),
+                (elapsedMs - runStartElapsed).coerceAtLeast(0L),
+                runPeak
+            )
+        }
+        val bytes = measures.first
+        val duration = measures.second
+        val peakRun = measures.third
+        val st = _state.value
+        val entry = HistoryEntry(
+            time = System.currentTimeMillis(),
+            mode = st.mode,
+            done = done,
+            skipped = skipped,
+            failed = failedItems.size,
+            bytes = bytes,
+            durationMs = duration,
+            avgSpeed = if (duration > 0) bytes / (duration / 1000.0) else 0.0,
+            peakSpeed = peakRun,
+            destination = st.destinationName ?: "",
+            verified = verified,
+            cancelled = cancelled,
+            failures = failedItems.take(30).map { Pair(it.name, it.error ?: "") }
+        )
+        val list = listOf(entry) + st.pastRuns
+        _state.update { it.copy(pastRuns = list.take(50)) }
+        Persistence.saveHistory(app, list)
+    }
+
+    fun clearHistory() {
+        _state.update { it.copy(pastRuns = emptyList()) }
+        scope.launch { Persistence.saveHistory(app, emptyList()) }
+    }
+
+    // ---------- Reprise après interruption ----------
+
+    private fun saveSession() {
+        val st = _state.value
+        val dest = st.destination
+        val remaining = items.filter { it.status != ItemStatus.DONE && it.status != ItemStatus.SKIPPED }
+        val sess = if (dest == null || remaining.isEmpty()) {
+            null
+        } else {
+            Session(
+                destination = dest,
+                mode = st.mode,
+                savedAt = System.currentTimeMillis(),
+                items = remaining.map { SessionItem(it.id, it.src, it.name, it.size, it.relDir, it.srcParent) },
+                folders = sourceFolders.map { SessionFolder(it.tree, it.docId, it.rel) }
+            )
+        }
+        synchronized(sessionLock) {
+            if (savedSession == null) Persistence.saveSession(app, sess)
+        }
+    }
+
+    /** Reprend la file sauvegardée : supprime les restes des fichiers interrompus puis relance. */
+    fun resumeSession() {
+        val sess = savedSession ?: return
+        if (isRunning) return
+        _state.update { it.copy(resumeOffer = null, message = "Reprise du transfert…") }
+        scope.launch {
+            for (i in sess.items) {
+                val restored = CopyItem(i.id, i.src, i.name, i.size, i.rel, i.srcParent)
+                restored.resumeCheck = true
+                items.add(restored)
+            }
+            nextId.set((sess.items.maxOfOrNull { it.id } ?: 0L) + 1)
+            for (f in sess.folders) sourceFolders.add(FolderRec(f.tree, f.docId, f.rel))
+            _state.update { it.copy(mode = sess.mode) }
+            prefs().edit().putString("mode", sess.mode.name).apply()
+            setDestination(sess.destination)
+            cleanupPartials(sess)
+            synchronized(sessionLock) { savedSession = null }
+            publish()
+            start()
+        }
+    }
+
+    fun discardSession() {
+        val sess = savedSession ?: return
+        synchronized(sessionLock) {
+            savedSession = null
+            Persistence.saveSession(app, null)
+        }
+        _state.update { it.copy(resumeOffer = null) }
+        scope.launch { cleanupPartials(sess) }
+    }
+
+    private fun cleanupPartials(sess: Session) {
+        val cr = app.contentResolver
+        for ((rel, group) in sess.items.groupBy { it.rel }) {
+            try {
+                val dir = findDir(sess.destination, rel) ?: continue
+                val listing = loadListing(sess.destination, dir)
+                for (i in group) {
+                    val leftover = listing["${i.name}.smartcopy-${i.id}.part"] ?: continue
+                    try {
+                        DocumentsContract.deleteDocument(cr, leftover.first)
+                    } catch (e: Exception) {
+                    }
+                }
+            } catch (e: Exception) {
+            }
+        }
+    }
+
+    private fun findDir(dest: Uri, rel: List<String>): Uri? {
+        var parent = DocumentsContract.buildDocumentUriUsingTree(dest, DocumentsContract.getTreeDocumentId(dest))
+        for (part in rel) {
+            parent = findChildDir(dest, parent, part) ?: return null
+        }
+        return parent
     }
 }
